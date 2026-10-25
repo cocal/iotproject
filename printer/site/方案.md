@@ -75,6 +75,8 @@ ESP8266 主动向 VPS 建立 TLS TCP 长连接。连接建立后是全双工的�
 
 **方案决策：实现通用反向 TCP 代理，但首版限制为每台 ESP8266 一个活动代理流。** 一条设备到 VPS 的 TLS 连接同时承载控制帧、打印任务帧和一个代理数据流；代理流关闭后才能开始下一条代理流。这样不需要 MQ，也不需要设备入站端口，协议和内存占用都可控。后续实测稳定后，再考虑多路复用。
 
+“一个活动代理流”不等于只能处理一个打印指令。VPS 可以持续接收多个打印请求，`PrintJob` 在 PostgreSQL 中排队；ESP8266 一次领取一个打印任务，收到 `completed`/`failed` 后再领取下一个。首版如果代理流正在占用数据通道，新的打印任务等待代理流关闭；如果需要代理和打印并发，再增加第二条 TLS 连接或实现应用层多路复用。
+
 VPS 的业务入口仍是 `POST /api/v1/print-commands`，设备隧道使用独立 `9443/TCP`。VPS 上的代理入口只监听 `127.0.0.1`，或放在 SSH/VPN 后面；它不直接暴露为无认证公网 SOCKS5。现有 HTTPS `poll` 接口在隧道网关完成前继续保留，作为打印任务恢复通道。
 
 首版代理只转发字节，不解析目标协议。帧使用长度边界和 `stream_id`；控制消息包括 `AUTH`、`OPEN`、`OPEN_OK`、`OPEN_ERROR`、`DATA`、`CLOSE`、`RESET`、`PING` 和 `PONG`。第一版每台设备只允许一个 `stream_id`，避免 ESP8266 同时保存多个 TCP socket 和多组缓冲区。
@@ -217,11 +219,11 @@ accepted -> rendering -> queued -> leased -> printing -> succeeded
 
 ### 6.2 一次打印任务流程
 
-1. 外部系统调用 `POST /api/v1/print-commands`，服务端保存参数并生成 ESC/POS 产物。
-2. 任务进入 `queued`；隧道网关找到目标设备的活动连接并原子领取任务，创建 `lease_id`。
+1. 外部系统调用 `POST /api/v1/print-commands`，服务端保存参数并生成 ESC/POS 产物；多个请求可以同时进入 `PrintJob` 队列。
+2. 任务进入 `queued`；隧道网关在没有代理流占用设备通道时，原子领取一个任务并创建 `lease_id`。
 3. VPS 发送 `TASK_BEGIN` 和分块 `TASK_DATA`；ESP8266 接收完整产物、校验长度和 SHA-256 后回复 `received`。
 4. ESP8266 向固定打印机接口输出前上报 `started`，输出结束后上报 `completed` 或 `failed`。
-5. 服务端记录投递尝试，任务进入终态或按租约/重试策略重新排队。
+5. 服务端记录投递尝试；当前任务完成后，调度器再领取下一个 `queued` 任务。
 
 ### 6.3 断网、重启和重复任务
 
