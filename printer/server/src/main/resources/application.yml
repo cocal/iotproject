@@ -1,0 +1,19 @@
+server:
+  port: 8080
+  shutdown: graceful
+
+spring:
+  datasource:
+    url: ${DATABASE_URL:jdbc:postgresql://localhost:5432/printer}
+    username: ${DATABASE_USERNAME:printer}
+    password: ${DATABASE_PASSWORD:printer}
+  flyway:
+    enabled: true
+
+printer:
+  api:
+    key: ${PRINT_API_KEY:}
+  legacy:
+    port: ${LEGACY_TCP_PORT:9100}
+  delivery:
+    reaper-delay-ms: ${DELIVERY_REAPER_DELAY_MS:30000}

@@ -1,0 +1,29 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: printer
+      POSTGRES_USER: printer
+      POSTGRES_PASSWORD: printer
+    volumes:
+      - printer-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U printer -d printer"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+  server:
+    build: .
+    environment:
+      DATABASE_URL: jdbc:postgresql://postgres:5432/printer
+      DATABASE_USERNAME: printer
+      DATABASE_PASSWORD: printer
+      PRINT_API_KEY: ${PRINT_API_KEY:?Set PRINT_API_KEY before starting}
+    ports:
+      - "8080:8080"
+      - "9100:9100"
+    depends_on:
+      postgres:
+        condition: service_healthy
+volumes:
+  printer-postgres:
