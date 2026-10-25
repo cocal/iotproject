@@ -48,8 +48,20 @@
 
 长连接使用带长度边界的应用层消息帧，至少包含设备 ID、消息类型、帧长度、stream/task ID 和租约 ID。设备上线时完成独立凭据鉴权并发送固件/打印机能力；双方使用心跳检测断线。任务帧包含产物长度、分块序号和 SHA-256，设备校验后发送应用层 `received` ACK，开始打印前发送 `started`，完成或失败后发送 `completed`/`failed`。TCP ACK 只表示网络栈收到字节，不能代替业务确认。
 
-## 内网 TCP 代理协议
+## 专用打印隧道协议
 
-运维用户先通过 SSH/VPN 访问 VPS 上仅监听 `127.0.0.1` 的 SOCKS5/转发入口。VPS 鉴权用户并校验 device、目标 CIDR 和端口权限后，通过设备 TLS 连接发送 `OPEN(stream_id, target_ip, target_port)`。ESP8266 再按本地允许列表校验目标、连接内网 TCP 服务并返回 `OPEN_OK`/`OPEN_ERROR`。双向数据以 `DATA(stream_id, bytes)` 帧传输，并通过 `WINDOW_UPDATE`、`CLOSE`、`RESET` 管理背压和生命周期。
+ESP8266 主动连接 VPS 的 `9443/TCP`，完成 TLS 服务端证书校验和每设备独立凭据鉴权。该连接只承载打印任务、设备心跳和打印结果，不接受任意目标地址/端口，也不实现通用内网代理。
 
-VPS 和设备两侧都必须校验目标地址/端口；首版只接受明确配置的 IPv4 CIDR/主机和端口，拒绝环回、链路本地、云元数据及未授权范围。VPS 入口要求 SSH/VPN 身份认证，不允许无认证公网访问。需要设置每设备并发流、空闲超时、帧大小、速率限制和审计记录。控制隧道断开时关闭代理流。代理流是临时 TCP 会话，不创建 `PrintJob`，也不由打印任务租约自动重试。
+任务帧使用长度边界，控制帧建议为：
+
+```text
+AUTH
+AUTH_OK
+TASK_BEGIN {task_id, lease_id, size, sha256, format}
+TASK_DATA  <ESC/POS binary chunk>
+TASK_END
+EVENT      {received|started|completed|failed}
+PING / PONG
+```
+
+ESP8266 完整接收并校验任务后发送 `received`，开始向固定配置的 UART 或打印机网络接口输出前发送 `started`，输出结束后发送 `completed`/`failed`。TCP ACK 只表示网络栈收到字节，不能代替业务确认。打印任务继续使用任务 ID、租约和至少一次投递语义。
