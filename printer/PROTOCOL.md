@@ -68,8 +68,16 @@ TASK_DATA  <ESC/POS binary chunk>
 TASK_END
 EVENT      {received|started|completed|failed}
 PING / PONG
+PROBE      {probe_id, target_ip, target_port, protocol}
+PROBE_RESULT {probe_id, status, evidence}
 ```
 
 VPS 收到已认证的代理请求后发送 `OPEN`；ESP8266 校验本地目标策略并主动连接内网目标，成功后返回 `OPEN_OK`，双方通过 `DATA` 双向转发。首版只接受配置的 IPv4 网段/主机和端口，设置单流、帧大小、空闲超时和速率限制。
 
 ESP8266 完整接收并校验打印任务后发送 `received`，开始向固定配置的 UART 或打印机网络接口输出前发送 `started`，输出结束后发送 `completed`/`failed`。TCP ACK 只表示网络栈收到字节，不能代替业务确认。打印任务继续使用任务 ID、租约和至少一次投递语义。代理流断开时释放目标 socket，不创建或重试 `PrintJob`。
+
+## 打印机发现
+
+Web/API 在 VPS 上创建发现任务并枚举已配置 CIDR 和预设端口；8266 只接收单个 `PROBE` 帧，不执行网段扫描。`9100/TCP` 只做连接探测并关闭，不发送打印字节；`631/TCP` 可发送只读 IPP `Get-Printer-Attributes`；`515/TCP` 只做 LPD 握手/队列查询；`80/443` 只读管理页。扫描结果返回协议证据和候选信息，不能仅凭 `9100` 开放就认定为打印机。
+
+页面按 `confirmed`、`probable`、`unknown` 展示候选，用户确认后保存逻辑 `printer_id` 与当前 IP/端口绑定。DHCP 改变地址时，再次触发发现更新绑定；业务打印请求只指定 `printer_id`。SNMP `161/UDP` 作为后续增强，需要额外 UDP 隧道，首版不依赖它。
