@@ -42,6 +42,6 @@ POST /api/v1/print-commands
 
 9100 收到单据后会保存原文、解析字段并生成 ESC/POS 产物。可通过 `GET /api/v1/print-jobs/{id}` 查询任务，或通过 `GET /api/v1/print-jobs/{id}/artifact` 下载字节流。生产环境应将查询和产物接口置于可信网络或反向代理认证之后。
 
-设备必须先写入 `devices` 表，`secret_sha256` 为设备密钥 UTF-8 字节的 SHA-256 小写十六进制值。当前代码中设备使用 `X-Device-Key` 调用 `/api/v1/devices/{deviceId}/poll`，当前租约时长为 120 秒。架构决策是后续增加 ESP8266 主动建立的专用 TLS TCP 长连接（建议独立端口 `9443`）作为主任务通道；该连接网关尚未实现，轮询接口会保留作恢复通道，不部署 MQ，也不提供任意 TCP 内网穿透。
+设备必须先写入 `devices` 表，`secret_sha256` 为设备密钥 UTF-8 字节的 SHA-256 小写十六进制值。当前代码中设备使用 `X-Device-Key` 调用 `/api/v1/devices/{deviceId}/poll`，当前租约时长为 120 秒。架构决策是后续增加 ESP8266 主动建立的 TLS TCP 隧道（建议独立端口 `9443`）作为主连接，承载打印任务和按目标策略授权的内网 TCP 代理；隧道网关和 VPS SOCKS5/转发入口尚未实现。轮询接口保留作打印任务恢复通道，不部署 MQ。代理入口应仅经 SSH/VPN 暴露，并同时限制设备侧可连接的目标 CIDR/端口。
 
 租约过期由后台定时任务回收，默认每 30 秒执行；每个任务最多投递 3 次，超过后进入 `failed`。
