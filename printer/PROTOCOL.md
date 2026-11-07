@@ -38,46 +38,152 @@
 3. 新接口和设备接口使用 UTF-8/JSON，不复用 GBK TCP 报文。
 4. 旧 JAR 的默认端口 9600 不作为现网监听端口；如需迁移兼容，可通过配置增加第二监听器。
 
-## 设备接口
+## 已实现的设备接口（旧路径）
 
-当前实现的设备接口使用 HTTPS/JSON，并在每个请求携带 `X-Device-Key`。数据库只保存密钥的 SHA-256，不保存明文。轮询返回短期租约、产物大小和 SHA-256；设备依次上报 `received`、`started` 和 `completed`/`failed`。它也是专用设备连接不可用时的恢复通道。
+现有 HTTPS/JSON 轮询接口使用 `X-Device-Key`，数据库保存密钥 SHA-256；具有领取、租约和事件上报代码。它保留兼容性，但新通用网关固件不实现轮询、任务 ID、租约、打印结果或去重；不可把两条投递路径同时用于同一个任务。隧道尚未实现，以下是协议 v1 草案。
 
-## 反向 TCP 隧道方案
+## 通用反向 TCP 隧道 v1
 
-首版设备通信决策是 ESP8266 主动连接 VPS 的独立 TLS TCP 端口（建议 `9443/TCP`），不部署 MQ，不开放设备入站端口。设备隧道既承载打印任务，也支持经认证、按目标策略授权的通用内网 TCP 代理。当前仓库尚未实现该连接网关；实现后，HTTPS 轮询仍保留作打印任务恢复通道，不承载代理流。
+### 1. 职责与连接边界
 
-长连接使用带长度边界的应用层消息帧，至少包含设备 ID、消息类型、帧长度、stream/task ID 和租约 ID。设备上线时完成独立凭据鉴权并发送固件/打印机能力；双方使用心跳检测断线。任务帧包含产物长度、分块序号和 SHA-256，设备校验后发送应用层 `received` ACK，开始打印前发送 `started`，完成或失败后发送 `completed`/`failed`。TCP ACK 只表示网络栈收到字节，不能代替业务确认。
-
-## 反向 TCP 隧道协议
-
-ESP8266 主动连接 VPS 的 `9443/TCP`，完成 TLS 服务端证书校验和每设备独立凭据鉴权。该连接承载打印任务、设备心跳、打印结果和受控的反向 TCP 代理流。首版每台设备只允许一个活动代理流，以控制 ESP8266 的内存和 socket 占用。
-
-所有帧使用长度边界和消息类型。控制帧建议为：
+ESP8266 仅负责 TLS/设备认证、按目标 IPv4/端口建立 LAN TCP、双向原样转发、连接状态、流控、心跳和重连。VPS 负责渲染、任务存储、授权、扫描调度、协议识别及打印结果判断。不部署 MQ，不实现 `TASK_*`、`EVENT` 或 `PROBE` 帧。
 
 ```text
-AUTH
-AUTH_OK
-OPEN      {stream_id, target_ip, target_port}
-OPEN_OK   {stream_id}
-OPEN_ERROR {stream_id, error_code}
-DATA      {stream_id, bytes}
-CLOSE     {stream_id}
-RESET     {stream_id, error_code}
-TASK_BEGIN {task_id, lease_id, size, sha256, format}
-TASK_DATA  <ESC/POS binary chunk>
-TASK_END
-EVENT      {received|started|completed|failed}
-PING / PONG
-PROBE      {probe_id, target_ip, target_port, protocol}
-PROBE_RESULT {probe_id, status, evidence}
+VPS 业务 / 扫描器          VPS 隧道网关              ESP8266            LAN 目标
+        |                       |                      |                  |
+        |                       |<-- 主动 TCP :9443 ---|                  |
+        |                       |<==== TLS 握手 ======>|                  |
+        |                       |<------ AUTH ---------|                  |
+        |                       |------- AUTH_OK ----->|                  |
+        | 请求目标 IP:端口       |                      |                  |
+        |---------------------->|------- OPEN -------->|-- TCP connect -->|
+        |                       |<------ OPEN_OK ------|                  |
+        | 原始业务字节           |------- DATA -------->|-- 原始字节 ----->|
+        |<----------------------|<------ DATA ---------|<-- 原始响应 ------|
+        |                       |<------ PING ---------|                  |
+        |                       |------- PONG -------->|                  |
+        | 发送端结束             |------- FIN --------->|-- shutdown 写端 ->|
+        |                       |<------ FIN ----------|<-- EOF -----------|
+        |                       |<------ CLOSED -------| 已排空并关闭       |
 ```
 
-VPS 收到已认证的代理请求后发送 `OPEN`；ESP8266 校验本地目标策略并主动连接内网目标，成功后返回 `OPEN_OK`，双方通过 `DATA` 双向转发。首版只接受配置的 IPv4 网段/主机和端口，设置单流、帧大小、空闲超时和速率限制。
+TLS 加密仅覆盖 VPS 与 ESP8266，TLS 在这两端终止。LAN 连接由 ESP8266 建立；其字节是否另有加密取决于目标协议（RAW 打印通常明文，HTTPS/SSH 可由 VPS 的上层客户端端到端加密）。VPS 不直接连接 LAN 地址。
 
-ESP8266 完整接收并校验打印任务后发送 `received`，开始向固定配置的 UART 或打印机网络接口输出前发送 `started`，输出结束后发送 `completed`/`failed`。TCP ACK 只表示网络栈收到字节，不能代替业务确认。打印任务继续使用任务 ID、租约和至少一次投递语义。代理流断开时释放目标 socket，不创建或重试 `PrintJob`。
+首版每设备最多一个活动流，连接建立中和关闭中也占用这个名额。控制帧可以与这个流交错；不是多个业务 TCP 连接的并发多路复用。一个流对应一对 TCP 端点，大文件和多个业务请求不必对应多个流。
 
-## 打印机发现
+### 2. 固定帧头
 
-Web/API 在 VPS 上创建发现任务并枚举已配置 CIDR 和预设端口；8266 只接收单个 `PROBE` 帧，不执行网段扫描。`9100/TCP` 只做连接探测并关闭，不发送打印字节；`631/TCP` 可发送只读 IPP `Get-Printer-Attributes`；`515/TCP` 只做 LPD 握手/队列查询；`80/443` 只读管理页。扫描结果返回协议证据和候选信息，不能仅凭 `9100` 开放就认定为打印机。
+TLS 内使用二进制帧。所有整数为无符号、网络字节序；固定头 16 字节，后接 `payload_length` 字节内容。
 
-页面按 `confirmed`、`probable`、`unknown` 展示候选，用户确认后保存逻辑 `printer_id` 与当前 IP/端口绑定。DHCP 改变地址时，再次触发发现更新绑定；业务打印请求只指定 `printer_id`。SNMP `161/UDP` 作为后续增强，需要额外 UDP 隧道，首版不依赖它。
+| 偏移 | 长度 | 字段 | 规则 |
+| --- | --- | --- | --- |
+| 0 | 2 | magic | ASCII `IT`，十六进制 `49 54` |
+| 2 | 1 | version | `1` |
+| 3 | 1 | type | 下表消息类型 |
+| 4 | 4 | stream_id | 控制帧为 0；目标流为非零 |
+| 8 | 4 | payload_length | DATA 最大 1024 字节；其他帧最大 512 字节 |
+| 12 | 4 | reserved | 必须为 0 |
+
+接收方增量读头、校验类型和长度，再读内容，不能按一次 `read/write` 判断消息边界。错误 magic、版本、保留位、未知类型、非法长度或无效状态直接关闭会话并释放目标；先验长度后分配内存，不尝试在任意业务数据中重新找帧头。TLS 已提供传输完整性保护，不另加自制加密或帧 CRC。
+
+### 3. 帧类型与内容
+
+除 `DATA` 与空内容帧外，payload 为 UTF-8 JSON 对象，字段名固定；拒绝重复 JSON 键，所有必填字段都要校验。ID 是短 ASCII 字符串；错误信息不能携带密钥。
+
+| type | 名称 | 方向 | stream_id / payload |
+| --- | --- | --- | --- |
+| 0x01 | AUTH | 设备→VPS | 0 / device_id、credential、firmware、lan_ip、netmask、gateway |
+| 0x02 | AUTH_OK | VPS→设备 | 0 / session_id、heartbeat_sec=30、timeout_sec=90、initial_window=4096 |
+| 0x03 | AUTH_ERROR | VPS→设备 | 0 / code |
+| 0x10 | OPEN | VPS→设备 | 非零 / target_ip、target_port、connect_timeout_ms、idle_timeout_sec、initial_window=4096 |
+| 0x11 | OPEN_OK | 设备→VPS | 同 OPEN / initial_window=4096 |
+| 0x12 | OPEN_ERROR | 设备→VPS | 同 OPEN / code |
+| 0x20 | DATA | 双向 | 非零 / 1--1024 字节原始数据 |
+| 0x21 | WINDOW_UPDATE | 双向 | 非零 / credit，正整数，单次最多 4096 |
+| 0x22 | FIN | 双向 | 非零 / 空，表示此方向没有更多 DATA |
+| 0x23 | CLOSED | 设备→VPS | 非零 / 空，目标资源已释放，流可回收 |
+| 0x24 | RESET | 双向 | 非零 / code，立即异常结束 |
+| 0x30 | PING | 设备→VPS | 0 / nonce，递增 uint32 |
+| 0x31 | PONG | VPS→设备 | 0 / 原样返回 nonce |
+
+AUTH 中 device_id 最长 64 字符，credential 最长 128 字符，firmware 最长 64 字符；JSON 整体仍不得超过 512 字节。凭据仅在校验证书后的 TLS 内发送；服务端比对每设备密钥摘要并限制认证尝试。初版 TLS 库建议 ESP8266 Arduino Core 的 BearSSL `WiFiClientSecure`，VPS 用服务端 TLS 实现；不调用跳过证书校验的 `setInsecure()`。
+
+`target_ip` 只接受 IPv4 数字地址，`target_port` 为 1--65535；不做 DNS 解析。VPS 校验设备的授权 CIDR/端口，设备保留最小本地网段限制，拒绝广播、组播、回环、未指定地址和禁止的目标。设备报告的 LAN 信息只是网段候选，不自动授予扫描权限。
+
+`stream_id` 在一个 TLS 会话内从 1 单调增加、不复用；耗尽则重新建会话。连接忙时新 OPEN 返回 `OPEN_ERROR(BUSY)`，保留原流。其他 OPEN_ERROR 包括 `DENIED`、`REFUSED`、`UNREACHABLE`、`CONNECT_TIMEOUT`。失败仅结束该 OPEN，不关闭正常隧道。已 CLOSED 的旧 stream_id 不得用于新 DATA；RESET 收尾期间允许读取并丢弃已经在途的旧流帧，禁止向目标转发，直到 CLOSED。
+
+### 4. 状态与关闭
+
+```text
+未连接 → TCP/TLS → 等待 AUTH_OK → 空闲
+                                  |
+                                OPEN
+                                  v
+                                建连中 --OPEN_ERROR--> 空闲
+                                  |
+                               OPEN_OK
+                                  v
+                                 转发
+                           /               \
+                      FIN /                 \ RESET/错误
+                         v                   v
+                       半关闭              异常回收 → 空闲
+                         |
+                 双向 FIN + 缓冲排空
+                         v
+                     CLOSED → 空闲
+
+任意状态：隧道失效 → 关闭 LAN socket → 退避重连 → 新认证
+```
+
+OPEN_ERROR 的连接尝试立即回到空闲，不需要 CLOSED。OPEN 成功前不能发 DATA。FIN 必须排在该方向全部 DATA 后，接收方先排空待写缓冲，再对目标 socket 执行写半关闭；反方向继续接收直到 EOF。FIN 后不得再发送该方向 DATA，WINDOW_UPDATE 与控制帧仍允许。设备在双向 FIN 且缓冲排空、目标关闭后发送 CLOSED，VPS 收到后才开始下一流；设备必须先把该流全部帧排在 CLOSED 前，防止新旧数据交错。若板端库无法实现半关闭，首版实现需先解决该能力或明确协议兼容范围，不能静默把 FIN 当全关闭。
+
+RESET 表示丢弃未发完数据并立即关闭目标，设备清理后发送 CLOSED；正常 TCP 缓冲排空不等于打印成功。关闭收尾默认上限 10 秒，超时发送 RESET(CLOSE_TIMEOUT)。其他 RESET 错误码包括 `TARGET_IO`、`FLOW_CONTROL`、`IDLE_TIMEOUT`。RESET 后不再发送旧流 DATA；VPS 需收到设备 CLOSED 或关闭重建隧道后才能 OPEN 下一流（异常 CLOSED 也仅表示资源已释放）。设备发送 RESET 时紧随 CLOSED；VPS 发送 RESET 时，设备仍需回 CLOSED；若 10 秒未收到 CLOSED 则重建隧道。
+
+### 5. 心跳、流控与串行性
+
+认证等待上限 10 秒；每次 LAN 建连默认 1500 ms，可由 VPS 指定 200--5000 ms；必须采用非阻塞或短时间分步调用，建连中同样处理心跳。目标流默认 120 秒无业务数据则 RESET，心跳不续目标流的空闲时间；OPEN 的 idle_timeout_sec 默认 120，允许 5--3600 秒；VPS 可按业务显式配置。
+
+设备每 30 秒发送一个新 nonce 的 PING，VPS 尽快返回 PONG；设备 90 秒没有收到匹配的 PONG 则重连，即使仍收到 DATA 也不覆盖此检测。VPS 90 秒无设备 PING 则关闭并标离线。协议状态、心跳和 I/O 在同一主循环协作处理，定时让出执行时间给 Wi-Fi 与看门狗；打印数据传输期间仍处理 PING/PONG。
+
+每个方向起始信用额度为 4096 字节（OPEN 宣告 VPS 的接收额度，即设备→VPS；OPEN_OK 宣告设备的接收额度，即 VPS→设备）；发送 DATA 消耗该方向额度。接收方只有在字节已被下一跳 socket 的 write 接受并腾出自身缓冲后，才发送 WINDOW_UPDATE 返还对应额度。额度不得超过初始窗口；超额 DATA/信用视为流控错误。每方向最多 4096 字节未消费数据，另留独立小型控制队列，避免业务缓冲满导致无法读取心跳。初始值是实机待验证的上限配置，TLS 自身缓冲另算。
+
+每帧写出必须串行且完整，允许部分 write 后继续；心跳可在 DATA 帧之间优先调度，不能插入半帧或越过已经入队的 TCP 字节。两个方向是全双工；首版“单流”限制不妨碍心跳。TCP 没有固定包长，1024 字节是协议 DATA 上限，不是 MSS/MTU；长文件连续拆为多帧，不在设备缓存整份文件，不计算业务 SHA-256。
+
+### 6. 断线与重试
+
+同一 TCP 连接内的丢包、排序、重传由协议栈负责，应用不对 DATA 做重复重发或逐帧确认。WINDOW_UPDATE 仅为缓冲流控，不是持久化 ACK，更不是打印确认。TLS 断开后，所有流与未写完的字节都失效，不做透明续传或重放。
+
+设备按 1、2、4、8、16、30 秒上限退避并加随机抖动重连，稳定在线 60 秒后重置退避；新 TLS 会话重新 AUTH。VPS 对同设备的新认证连接接管在线记录并关闭旧连接，拒绝旧会话回调更新新状态。认证失败继续限速退避，不密集重试。
+
+VPS 保存任务、产物与投递记录，应用根据目标协议判断是否可重试。OPEN 失败且未发送业务字节可以重新安排；发送过打印字节后断线或未收到打印机明确成功反馈，结果标记“未知/待确认”，不自动重打以免重复出纸。TCP write 成功、WINDOW_UPDATE、CLOSED 都不能证明真实出纸。若业务协议要求 checksum/作业 ID，由 VPS 与打印机协议处理，ESP8266 不理解它们。
+
+### 7. 发现内网 IP：复用 OPEN/DATA
+
+```text
+Web                    VPS 扫描器                ESP8266          LAN 候选
+ | 点击发现                |                       |                 |
+ |------------------------>| 枚举授权 CIDR/端口      |                 |
+ |                         |-- OPEN(IP,9100) ------>|-- TCP connect ->|
+ |                         |<- OPEN_OK / ERROR ----|                 |
+ |                         |-- FIN（不发打印数据） ->|-- 关闭写端 ---->|
+ |                         |<- FIN/CLOSED ----------|                 |
+ |                         |-- OPEN(IP,631) ------->|-- TCP connect ->|
+ |                         |-- DATA(IPP只读请求) -->|-- 原字节 ------>|
+ |                         |<- DATA(IPP响应) -------|<- 原字节 -------|
+ |                         | VPS 解析名称/型号       |                 |
+ |<-- 候选与证据，确认绑定 --|                       |                 |
+```
+
+扫描、打印、普通代理共用唯一流，由 VPS 排队调度；打印优先，扫描仅在流关闭后让出，不能插入正在打印的字节流。扫描一次一个目标；连接成功后如目标不主动 EOF，可在短收尾超时后 RESET，等待 CLOSED 后继续。VPS 可在下一个目标开始前暂停/取消扫描。
+
+9100/TCP 仅连通性检查，绝不发送测试打印内容；开放端口只能算候选。631/TCP 使用 VPS 构造并解析的 IPP Get-Printer-Attributes；515/TCP 只在已知队列和只读操作范围内探测；80/443 页面由 VPS 发请求并识别，443 的 TLS 由 VPS 上层客户端经透明流与目标握手，校验证书。SNMP/广播 mDNS 等 UDP 不在本协议范围内。无法确认身份的设备保持 unknown，由用户确认绑定；IP 变化重新触发发现，不硬编码到固件。
+
+### 8. 实现顺序与验收
+
+1. VPS 网关与 Linux 协议客户端：AUTH、OPEN、双向 DATA、信用窗口、关闭及心跳；用 echo 服务验证透明传输。
+2. 故障验证：逐字节/合帧读取、部分写、越界帧、窗口耗尽、慢目标、半关闭、目标拒绝、TLS 断开、旧会话替换、单流 BUSY；校验接收字节与源数据一致。
+3. ESP8266 固件与 VPS 联调：证书校验、watchdog、堆内存、持续转发和重连；特别验证慢目标时心跳不被业务缓冲饿死。
+4. VPS 打印与发现适配：任务路由到目标、只读探测和结果未知处理。无目标协议确认前不承诺“恰好打印一次”。
+
+以上是可实现的协议草案，不代表网关或固件已经完成；当前仓库设备端仍只有说明文档。
