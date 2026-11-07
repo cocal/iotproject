@@ -5,3 +5,5 @@
 打印、扫描和设备识别都在 VPS；扫描复用普通 OPEN/DATA，没有 PROBE 帧。网络目标可动态指定，不写死打印机 IP。
 
 协议以 [PROTOCOL.md](../../PROTOCOL.md) 的 v1 为准。当前目录尚无固件；建议使用 ESP8266 Arduino Core BearSSL WiFiClientSecure，实机验证 TLS 内存、非阻塞建连、半关闭、窗口耗尽时心跳、watchdog 与重连稳定性。
+
+Linux 参考客户端已实现于 ../simulator，可先测试网关协议与双向流；不模拟芯片资源。

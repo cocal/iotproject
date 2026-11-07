@@ -17,3 +17,11 @@ printer:
     port: ${LEGACY_TCP_PORT:9100}
   delivery:
     reaper-delay-ms: ${DELIVERY_REAPER_DELAY_MS:30000}
+  tunnel:
+    enabled: ${TUNNEL_ENABLED:false}
+    bind: ${TUNNEL_BIND:0.0.0.0}
+    port: ${TUNNEL_PORT:9443}
+    max-connections: ${TUNNEL_MAX_CONNECTIONS:64}
+    key-store: ${TUNNEL_KEY_STORE:}
+    key-store-password: ${TUNNEL_KEY_STORE_PASSWORD:}
+    mappings: []

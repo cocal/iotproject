@@ -1,0 +1,15 @@
+# Merge with application.yml using --spring.config.additional-location=file:./tunnel-example.yml
+# Device must already exist in the devices table with SHA-256(device credential).
+printer:
+  tunnel:
+    enabled: true
+    bind: 0.0.0.0
+    port: 9443
+    key-store: ${TUNNEL_KEY_STORE}
+    key-store-password: ${TUNNEL_KEY_STORE_PASSWORD}
+    max-connections: 64
+    mappings:
+      - device-id: gateway-room-1
+        local-port: 19100
+        target-ip: 192.168.1.50
+        target-port: 9100
