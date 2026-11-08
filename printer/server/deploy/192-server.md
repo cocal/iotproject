@@ -14,7 +14,7 @@
 
 2026-11-08 已通过 SSH 转发验证 IP 主机名校验、TLS 1.2、设备 AUTH_OK、PING/PONG；实际协商 ECDHE-RSA-AES256-GCM-SHA384，这是 Linux 测试结果，非 ESP8266 兼容性验证。
 
-从文档 VPS 直连公网 9443 超时；目标主机确已监听且 nftables 无拦截，仍需检查云安全组/上游 ACL 并放行 TCP 9443。未声称公网可用。
+2026-11-08 用户放行公网端口后，从文档 VPS 直连 SERVER_IP_REDACTED:9443 成功，完成 TLS 证书/IP 校验、设备 AUTH_OK 及 PING/PONG 验证。公网隧道入口可达；真实打印机转发仍未验证。
 
 证书续期/替换后需要重新生成 PKCS12 并重启服务，当前没有自动重载。
 
