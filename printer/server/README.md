@@ -75,3 +75,14 @@ mvn test
 测试生成临时证书，不依赖数据库，使用 Linux 参考客户端跨语言验证真实 TLS、256 KiB 二进制双向透传、EOF 后响应、连续新流、心跳、单流忙、鉴权失败、旧会话替换、非法信用和超长帧。信用窗口耗尽时仍须响应心跳；不信任的 TLS 证书必须被拒绝。测试需要 Python 3 和非回环 IPv4 网卡。
 
 9100 接收的单据写入 print_jobs：保留按行重建的原文、GBK 编码标记、解析字段、接收时间、渲染产物与状态；V4 起新增 source_ip (PostgreSQL INET)，记录 TCP socket 实际对端 IP，GET 任务详情返回 sourceIp。历史记录无法回填，保持 NULL；若经 TCP 中转/NAT，记录的是本服务看到的中转/出口地址，不信任单据自行声明的来源。
+
+## 打印控制台
+
+当前服务器已部署只读后台 `https://printer.ohmyskills.top/console/`。登录后可分页查看 `print_jobs` 的接收时间、单号、客户、TCP 来源 IP、状态、渲染产物大小，并打开原文和解析结果详情。筛选支持单号/客户、来源 IP、状态和北京时间日期范围。
+
+控制台是独立 Python/Flask 进程，只通过现有 WireGuard 到 192 服务器 PostgreSQL `10.79.0.2` 访问；数据库账号为只读并设置了 5 秒查询超时。Nginx 仅反代 `/console/`，应用绑定 `127.0.0.1:18082`。管理密码不写仓库，保存在当前服务器 `/etc/printer-console/admin.json`，运行密钥在 `/etc/printer-console/service.env`。
+
+```bash
+systemctl status printer-console
+journalctl -u printer-console -n 100 --no-pager
+```
