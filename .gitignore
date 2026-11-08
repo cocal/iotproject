@@ -13,3 +13,7 @@
 # Python simulator bytecode
 __pycache__/
 *.pyc
+
+# ESP8266 local credentials and build products
+printer/device/esp8266/include/config.h
+.pio/

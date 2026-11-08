@@ -21,14 +21,14 @@ public class PrintJobRepository {
         this.objectMapper = objectMapper;
     }
 
-    public UUID createLegacyJob(String rawPayload, Map<String, Object> parsedPayload) {
+    public UUID createLegacyJob(String rawPayload, Map<String, Object> parsedPayload, String sourceIp) {
         UUID id = UUID.randomUUID();
         try {
             String json = objectMapper.writeValueAsString(parsedPayload);
             jdbcTemplate.update("""
-                    INSERT INTO print_jobs (id, source, raw_payload, payload_encoding, parsed_payload)
-                    VALUES (?, 'legacy_tcp', ?, 'GBK', ?::jsonb)
-                    """, id, rawPayload, json);
+                    INSERT INTO print_jobs (id, source, raw_payload, payload_encoding, parsed_payload, source_ip)
+                    VALUES (?, 'legacy_tcp', ?, 'GBK', ?::jsonb, ?::inet)
+                    """, id, rawPayload, json, sourceIp);
             return id;
         } catch (JsonProcessingException e) {
             throw new IllegalStateException("Could not serialize parsed print payload", e);
@@ -89,7 +89,7 @@ public class PrintJobRepository {
     public Optional<PrintJobView> findById(UUID id) {
         return jdbcTemplate.query("""
                 SELECT id, source, status, render_status, delivery_status, artifact_size,
-                       artifact_sha256, received_at, rendered_at, error_code, error_message
+                       artifact_sha256, received_at, rendered_at, error_code, error_message, host(source_ip) AS source_ip
                 FROM print_jobs WHERE id = ?
                 """, (rs, rowNum) -> new PrintJobView(
                 rs.getObject("id", UUID.class),
@@ -102,7 +102,7 @@ public class PrintJobRepository {
                 rs.getTimestamp("received_at").toInstant(),
                 rs.getTimestamp("rendered_at") == null ? null : rs.getTimestamp("rendered_at").toInstant(),
                 rs.getString("error_code"),
-                rs.getString("error_message")), id).stream().findFirst();
+                rs.getString("error_message"), rs.getString("source_ip")), id).stream().findFirst();
     }
 
     public Optional<byte[]> findArtifact(UUID id) {
@@ -123,6 +123,6 @@ public class PrintJobRepository {
     public record PrintJobView(UUID id, String source, String status, String renderStatus,
                                String deliveryStatus, Long artifactSize, String artifactSha256,
                                java.time.Instant receivedAt, java.time.Instant renderedAt,
-                               String errorCode, String errorMessage) {
+                               String errorCode, String errorMessage, String sourceIp) {
     }
 }

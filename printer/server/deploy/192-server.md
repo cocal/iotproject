@@ -27,3 +27,5 @@ systemctl status printer-tunnel
 journalctl -u printer-tunnel -n 100 --no-pager
 curl -fsS http://127.0.0.1:18080/healthz
 ```
+
+2026-11-08 部署来源 IP 记录：Flyway V4 添加 print_jobs.source_ip (INET)，旧 TCP 接收器从 socket 对端获取 IP，任务查询返回 sourceIp；历史行保持 NULL。公网测试验证来源 154.12.18.57、GBK 渲染正常，测试任务随后取消。另登记设备 gateway-esp8266-1，其私有凭据存 /etc/printer-tunnel/esp8266-device.json，不入库源码。

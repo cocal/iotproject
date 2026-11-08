@@ -79,6 +79,7 @@ public class LegacyTcpReceiver {
     private void handle(Socket socket) {
         List<String> lines = new ArrayList<>();
         boolean submitted = false;
+        String sourceIp = socket.getInetAddress().getHostAddress();
         try (socket;
              BufferedReader reader = new BufferedReader(
                      new InputStreamReader(socket.getInputStream(), Charset.forName("GBK")))) {
@@ -90,18 +91,18 @@ public class LegacyTcpReceiver {
                 }
                 lines.add(line);
                 if (!submitted && line.contains("地址")) {
-                    persist(lines);
+                    persist(lines, sourceIp);
                     submitted = true;
                 }
             }
             if (!submitted && !lines.isEmpty()) {
-                persist(lines);
+                persist(lines, sourceIp);
             }
         } catch (Exception e) {
             log.warn("Could not receive legacy print payload from {}", socket.getRemoteSocketAddress(), e);
             if (!submitted && !lines.isEmpty()) {
                 try {
-                    persist(lines);
+                    persist(lines, sourceIp);
                 } catch (Exception persistError) {
                     log.error("Could not persist partial legacy print payload", persistError);
                 }
@@ -109,10 +110,10 @@ public class LegacyTcpReceiver {
         }
     }
 
-    private void persist(List<String> lines) {
+    private void persist(List<String> lines, String sourceIp) {
         String rawPayload = String.join("\n", lines);
         var parsed = parser.parse(lines);
-        var id = jobs.createLegacyJob(rawPayload, parsed);
+        var id = jobs.createLegacyJob(rawPayload, parsed, sourceIp);
         try {
             byte[] artifact = renderer.render(parsed);
             jobs.markRendered(id, artifact, sha256(artifact));
