@@ -6,7 +6,7 @@
 <p>解压 ZIP，打开同名目录中的 .ino，点击验证、上传。无需安装 PlatformIO 或额外第三方库，ArduinoJson 源码已随包提供，保持目录完整。</p>
 <a class="button" href="files/printer-tunnel-arduino-win7.zip" download>下载 Arduino ZIP（公开模板）</a>
 <a href="files/printer_tunnel_esp8266.ino" download>查看主 .ino</a> · <a href="files/README-WIN7.md" download>下载操作说明</a>
-<p>公开模板的 TUNNEL_HOST、DEVICE_ID、DEVICE_KEY 和信任证书均为占位值，使用前自行填写。私发的 gateway-esp8266-1 专属 ZIP 已填好凭据和独立信任证书，但 TUNNEL_HOST 同样已脱敏，须自行填写，不在公开网站提供。仅下载 .ino 不能替代完整 ZIP 中的配套头文件。</p></section>
+<p>公开模板已内置独立隧道公开信任证书；TUNNEL_HOST、DEVICE_ID、DEVICE_KEY 为占位值，使用前自行填写。私发的 gateway-esp8266-1 专属 ZIP 已填好凭据和独立信任证书，但 TUNNEL_HOST 同样已脱敏，须自行填写，不在公开网站提供。仅下载 .ino 不能替代完整 ZIP 中的配套头文件。</p></section>
 <section><h2>1. 准备 Arduino 环境</h2><ol>
 <li>安装 <a href="https://downloads.arduino.cc/arduino-1.8.19-windows.zip">Arduino IDE 1.8.19 Windows ZIP</a>，不使用 IDE 2.x。</li>
 <li>首选项 → 附加开发板管理器网址：<code>https://arduino.esp8266.com/stable/package_esp8266com_index.json</code></li>
@@ -43,7 +43,25 @@ extern &quot;C&quot; {
 // Copy the PUBLIC trusted-server.crt contents here (never its private key).
 static const char TRUSTED_CERT[] PROGMEM = R&quot;PEM(
 -----BEGIN CERTIFICATE-----
-PASTE_THE_PUBLIC_TUNNEL_CERTIFICATE_HERE
+MIIDijCCAnKgAwIBAgIUWiMDUnWV9vtc9aIJ+x13r/JZtIUwDQYJKoZIhvcNAQEL
+BQAwOTEXMBUGA1UECgwOUHJpbnRlciBUdW5uZWwxHjAcBgNVBAMMFVByaW50ZXIg
+VHVubmVsIFNlcnZlcjAgFw0yNjExMDgwOTA4MDFaGA8yMDU2MTEwODA5MDgwMVow
+OTEXMBUGA1UECgwOUHJpbnRlciBUdW5uZWwxHjAcBgNVBAMMFVByaW50ZXIgVHVu
+bmVsIFNlcnZlcjCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBAMCDECqq
+4F6elpg96FtAtJe0muJbgH8Pd3w2x7gWCjrMFbmPh6uZoMVvB5SrCJpFoQbLUKlc
+3FlE9TuykIbToTmxmzm3PJG8Bv6LJrFnYNgbxHJtJ3uVDDHJCCRIH+Z+upC1NPps
+Elk7w7ziERtpiRujKRuC8ATOZjgyclJy4kAy10BPs7MdnukCQxUnRQjcthNfCGv5
+m/7uPVrDNb0g2m6MCQpH5DLRzwpwybR9ijaOg+YU87nWgaITiS5H05Lj/SNsDcUN
+7bnT/QtZrAjopZO4l7olEn2uBvjokNOyw/+y/8P4gO/5rIzhHS7WXsPIJy6s0HPp
+aVnjmPmE8UkjNpsCAwEAAaOBhzCBhDAdBgNVHQ4EFgQUmIWR62JFFOGJY2UawqQA
+MAw+PTYwHwYDVR0jBBgwFoAUmIWR62JFFOGJY2UawqQAMAw+PTYwDwYDVR0RBAgw
+BocEwJCO7TAMBgNVHRMBAf8EAjAAMA4GA1UdDwEB/wQEAwIFoDATBgNVHSUEDDAK
+BggrBgEFBQcDATANBgkqhkiG9w0BAQsFAAOCAQEAKR5SZLAB8V/livFZk+V6E9JC
+DiUJeyuky18dvS0+ilHeoJZiPHrjtErBVqPvUmM3n37IcB16WfpDBHIQF1TZyXpq
+pByfU6sYIKg1NV5cxgxqqCmUexqRbF1e7wazEhhwhU97Ifv+QqJ4tacfw7ThcCo2
+IIRmuwubBlwMpYyo4tLuniFr5cQXASd3bnaNot+TjvBIN6+ZINqT2z+t4Rqa9Eaa
+FJuieHV1XWxD/rSHxLZ8oJtNScv29RIBViI4xKHF6CtEijJv6IiyP9Xfc2vNWabK
+adNnGy6E+novIlj92y6/Z4+d59H9hC/4jqVycGI5DGo1FGrb4R0YBtRQaYktMg==
 -----END CERTIFICATE-----
 )PEM&quot;;
 

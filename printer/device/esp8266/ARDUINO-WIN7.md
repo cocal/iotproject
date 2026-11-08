@@ -16,7 +16,7 @@
 
 解压后目录为 printer_tunnel_esp8266，主文件为 printer_tunnel_esp8266.ino，两者名字必须一致。双击 .ino，不要把 ZIP 内文件散放或删除 ArduinoJson 文件夹。
 
-公开下载模板需要在程序顶部填写 TUNNEL_HOST、DEVICE_ID、DEVICE_KEY 和隧道公开信任证书。私下发送的 gateway-esp8266-1 专属 ZIP 已填好设备凭据及独立隧道信任证书，TUNNEL_HOST 已脱敏，需自行填写实际地址；不要公开该 ZIP，也不要将同一设备凭据烧到多块板，否则会相互顶掉会话。
+公开下载模板需要在程序顶部填写 TUNNEL_HOST、DEVICE_ID、DEVICE_KEY；独立隧道公开信任证书已内置。私下发送的 gateway-esp8266-1 专属 ZIP 已填好设备凭据及独立隧道信任证书，TUNNEL_HOST 已脱敏，需自行填写实际地址；不要公开该 ZIP，也不要将同一设备凭据烧到多块板，否则会相互顶掉会话。
 
 ## 3. 选择工具菜单
 
