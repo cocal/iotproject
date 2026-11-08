@@ -11,6 +11,7 @@ import re
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--config', type=Path, help='Private config.h; omitted uses public placeholder example')
 parser.add_argument('--output', type=Path, required=True)
+parser.add_argument('--redact-host', action='store_true', help='Replace the endpoint with a placeholder in a private source package')
 args = parser.parse_args()
 root = Path(__file__).resolve().parents[1]
 config = args.config or root / 'include/config.example.h'
@@ -21,7 +22,10 @@ with tempfile.TemporaryDirectory() as temporary:
     sketch = Path(temporary) / 'printer_tunnel_esp8266'
     sketch.mkdir()
     source = (root / 'src/main.cpp').read_text().replace('#include <ArduinoJson.h>', '#include "ArduinoJson.h"')
-    source = source.replace('#include "config.h"', config.read_text().replace('#pragma once\n', ''))
+    configuration = config.read_text().replace('#pragma once\n', '')
+    if args.redact_host:
+        configuration = re.sub(r'^#define TUNNEL_HOST .*$', '#define TUNNEL_HOST "YOUR_TUNNEL_HOST"', configuration, flags=re.M)
+    source = source.replace('#include "config.h"', configuration)
     (sketch / 'printer_tunnel_esp8266.ino').write_text(source)
     for item in (library / 'src').iterdir():
         if item.is_dir():

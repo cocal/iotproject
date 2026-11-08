@@ -6,7 +6,7 @@
 <p>解压 ZIP，打开同名目录中的 .ino，点击验证、上传。无需安装 PlatformIO 或额外第三方库，ArduinoJson 源码已随包提供，保持目录完整。</p>
 <a class="button" href="files/printer-tunnel-arduino-win7.zip" download>下载 Arduino ZIP（公开模板）</a>
 <a href="files/printer_tunnel_esp8266.ino" download>查看主 .ino</a> · <a href="files/README-WIN7.md" download>下载操作说明</a>
-<p>公开模板的 DEVICE_ID / DEVICE_KEY 为占位符，需要填写服务器分配的设备凭据。私发的 gateway-esp8266-1 专属 ZIP 已填好凭据，不在公开网站提供。仅下载 .ino 不能替代完整 ZIP 中的配套头文件。</p></section>
+<p>公开模板的 TUNNEL_HOST、DEVICE_ID、DEVICE_KEY 和信任证书均为占位值，使用前自行填写。私发的 gateway-esp8266-1 专属 ZIP 已填好凭据和独立信任证书，但 TUNNEL_HOST 同样已脱敏，须自行填写，不在公开网站提供。仅下载 .ino 不能替代完整 ZIP 中的配套头文件。</p></section>
 <section><h2>1. 准备 Arduino 环境</h2><ol>
 <li>安装 <a href="https://downloads.arduino.cc/arduino-1.8.19-windows.zip">Arduino IDE 1.8.19 Windows ZIP</a>，不使用 IDE 2.x。</li>
 <li>首选项 → 附加开发板管理器网址：<code>https://arduino.esp8266.com/stable/package_esp8266com_index.json</code></li>
@@ -16,8 +16,8 @@
 <section><h2>2. 编译和上传</h2><table><tr><th>菜单</th><th>选择</th></tr>
 <tr><td>开发板</td><td>NodeMCU 1.0 (ESP-12E Module)，4MB Flash</td></tr><tr><td>CPU Frequency</td><td>160MHz</td></tr><tr><td>Flash Size</td><td>4MB，1MB FS</td></tr><tr><td>Flash Mode / Frequency（若显示）</td><td>DIO / 40MHz</td></tr><tr><td>Upload Speed</td><td>115200</td></tr><tr><td>Port</td><td>实际 COM 端口</td></tr></table>
 <p>先验证再上传。裸 ESP-12F 需要 3.3V 稳定供电、USB-TTL；GPIO0 接地后复位进入下载，完成后松开 GPIO0 并重启。ESP-01 1MB 等其他板型不能直接照此配置。</p></section>
-<section><h2>3. 手机配置 Wi-Fi</h2><ol><li>连接热点 <strong>Gateway-xxxx</strong>，密码 <strong>setup8266</strong>。</li><li>打开 <strong>http://192.168.4.1</strong>，填 2.4GHz Wi-Fi，保存后设备自动重启。</li><li>串口 115200 观察 <code>Tunnel online</code>。正常启动后长按 FLASH 5 秒可重新配网。</li></ol>
-<p>设备需先完成 NTP 对时才能验证证书。隧道连接到 SERVER_IP_REDACTED:9443；上线不代表已绑定打印机，VPS 真实目标映射与自动打印投递仍需配置/接入。固件已编译，尚无板卡实测。</p></section>
+<section><h2>3. 手机配置 Wi-Fi</h2><p>Java 隧道独立终止 TLS，不经过 Nginx；独立自签证书有效期 2026-11-08 至 2056-11-08。旧 BIN 必须更新，不能继续使用原 Nginx 信任证书。</p><ol><li>连接热点 <strong>Gateway-xxxx</strong>，密码 <strong>setup8266</strong>。</li><li>打开 <strong>http://192.168.4.1</strong>，填 2.4GHz Wi-Fi，保存后设备自动重启。</li><li>串口 115200 观察 <code>Tunnel online</code>。正常启动后长按 FLASH 5 秒可重新配网。</li></ol>
+<p>设备需先完成 NTP 对时才能验证证书。实际地址须自行填写 TUNNEL_HOST，端口 9443；上线不代表已绑定打印机，VPS 真实目标映射与自动打印投递仍需配置/接入。固件已编译，尚无板卡实测。</p></section>
 <section><h2>4. 完整程序（公开模板）</h2><details><summary>展开 .ino 源码</summary><pre><code>#include &lt;Arduino.h&gt;
 #include &lt;ESP8266WiFi.h&gt;
 #include &lt;WiFiClientSecureBearSSL.h&gt;
@@ -32,7 +32,7 @@ extern &quot;C&quot; {
 #define WIFI_SSID &quot;YOUR_WIFI&quot;
 #define WIFI_PASSWORD &quot;YOUR_WIFI_PASSWORD&quot;
 // Must match the server certificate SAN. Prefer a DNS hostname.
-#define TUNNEL_HOST &quot;SERVER_IP_REDACTED&quot;
+#define TUNNEL_HOST &quot;YOUR_TUNNEL_HOST&quot;
 #define TUNNEL_PORT 9443
 #define DEVICE_ID &quot;YOUR_DEVICE_ID&quot;
 #define DEVICE_KEY &quot;YOUR_INDEPENDENT_DEVICE_KEY&quot;
@@ -43,27 +43,7 @@ extern &quot;C&quot; {
 // Copy the PUBLIC trusted-server.crt contents here (never its private key).
 static const char TRUSTED_CERT[] PROGMEM = R&quot;PEM(
 -----BEGIN CERTIFICATE-----
-MIIDxDCCAqygAwIBAgIUGEu1xuNScgOXJn7RMOEqH9TPfzEwDQYJKoZIhvcNAQEL
-BQAwQDELMAkGA1UEBhMCQ04xFDASBgNVBAoMC0lvVCBNb25pdG9yMRswGQYDVQQD
-DBJpb3Qub2hteXNraWxscy50b3AwHhcNMjYwODMwMDQ1NzEyWhcNMzYwODI3MDQ1
-NzEyWjBAMQswCQYDVQQGEwJDTjEUMBIGA1UECgwLSW9UIE1vbml0b3IxGzAZBgNV
-BAMMEmlvdC5vaG15c2tpbGxzLnRvcDCCASIwDQYJKoZIhvcNAQEBBQADggEPADCC
-AQoCggEBANbVbPAynlCwRw4BFHwHz49trkpuw+M5S4LOBPn+FEwgsFjR6t3h4atk
-32vX1H3N+Emkk13LQEziyq4ntV4RlUTGXweE2SUhZrRlWLIlhEPDtm2Bxknw64DM
-lpXpOpdSFlvzkXigaLuw+peIfH42lhbuMZgfDYvYqc+tbi/wHoXliHRL3WHTMAQM
-qhoyn+Ik1S1/qrMzM5ozYpvg9zdW6qIXZKhGAxWZBwNwAQe5W7JiX+gp6sM7RMvG
-vmh6dpPKTiNkqleSmCZQNAs7ZjReFB2/z98sJ++YyTBT7Zw2oxrfOIz6ZLFIAJJS
-fs4mYZ3BsLuFfEPL0QaHILCuKpjxCx0CAwEAAaOBtTCBsjAdBgNVHQ4EFgQU42M8
-XnBhjc4ypOyLFQqJvmFqZ7cwHwYDVR0jBBgwFoAU42M8XnBhjc4ypOyLFQqJvmFq
-Z7cwDwYDVR0TAQH/BAUwAwEB/zA6BgNVHREEMzAxghJpb3Qub2hteXNraWxscy50
-b3CCCWxvY2FsaG9zdIcEfwAAAYcECgIIEIcEwJCO7TAOBgNVHQ8BAf8EBAMCBaAw
-EwYDVR0lBAwwCgYIKwYBBQUHAwEwDQYJKoZIhvcNAQELBQADggEBAJUhFmMga3Et
-kBXpnTsTqHNcGMlql4e/XqKnAHzJmk4vWcLERjt7qFGcLJfaK1JZ2BgPQlrEJn4k
-7gWauot0/Dt1GYYL/6Jo+H1S0Fygl2yJPYlh9qaBBtfHzI/3KX5BDYchphieUr74
-UxJXV77uQlnHQXm8ZUo7C5Endf5yUbypcJ4k3Sc74/Iob53n/ze3pAUZcMsZaXag
-jJDEA1UJGxOeG0L+e9LNidJDzfJpFON4GMLVXV5iSFEW7aG8cgr3P7aS759mSUsx
-biTMgtZgTXbeifgBrDXLgl07avSHU9APW4lhYrm+J+Hxh2rDDEAefqDfEdsBX9hK
-MDB9SzSxvU0=
+PASTE_THE_PUBLIC_TUNNEL_CERTIFICATE_HERE
 -----END CERTIFICATE-----
 )PEM&quot;;
 

@@ -20,7 +20,7 @@ pio device monitor --port /dev/ttyUSB0 --baud 115200
 
 固件仅做 TLS/设备认证、OPEN 指定目标、DATA 原样转发、信用流控、半关闭、心跳与重连。LAN 目标使用异步 lwIP TCP，VPS 连接使用 BearSSL；目标内存不足时背压，设备不存整份文件、不处理打印任务、不扫描或识别协议。设备 ID/密钥需先在 VPS devices 表注册。当前服务器映射配置为空；上线不等于已绑定打印机或自动打印。
 
-公网目标为 SERVER_IP_REDACTED:9443。现有 iot.ohmyskills.top DNS 仍指向另一台机器，不应直接用该域名连接 192。BearSSL 的名称验证针对 DNS SAN；数字 IP 模式通过 IPAddress 重载连接，使用指定服务器的精确自签证书作唯一信任锚，不执行 DNS 名称校验。不得把此模式的信任锚替换为宽泛公有 CA。未来配置匹配的 DNS 记录时，可用域名模式同时执行链与名称校验；没有 setInsecure 回退。
+实际目标仅保存在私有构建配置，公开源码 TUNNEL_HOST 使用占位值；服务端口为 9443。BearSSL 的名称验证针对 DNS SAN；数字 IP 模式通过 IPAddress 重载连接，使用指定服务器的精确自签证书作唯一信任锚，不执行 DNS 名称校验。不得把此模式的信任锚替换为宽泛公有 CA。未来配置匹配的 DNS 记录时，可用域名模式同时执行链与名称校验；没有 setInsecure 回退。
 
 设备需要 NTP 时间验证证书有效期；无法获取时间时等待，不忽略证书验证。保留 BearSSL 默认接收缓冲，因为 1KiB 应用帧不代表 TLS 记录不超过 1KiB。握手和 TLS write 可能短时阻塞，需上板验证心跳延迟、剩余堆、watchdog、断线与半关闭。当前 ArduinoJson 控制帧解析不单独检测重复键，不能将未认证来源直接接入设备控制流。
 
@@ -28,7 +28,7 @@ pio device monitor --port /dev/ttyUSB0 --baud 115200
 
 ## 单文件交付版
 
-设备 ID 为 gateway-esp8266-1 的私有构建已内嵌凭据及 192 服务器公开信任证书，输出交付到工作区 artifacts；BIN 含独立设备密钥，不入 Git 或公共文档站点。只对应一块设备，烧录到多块会导致同 ID 会话相互接管。
+设备 ID 为 gateway-esp8266-1 的私有构建已内嵌凭据及 独立隧道公开信任证书，输出交付到工作区 artifacts；脱敏 Arduino ZIP 的 TUNNEL_HOST 需自行填写；BIN 含独立设备密钥，不入 Git 或公共文档站点。只对应一块设备，烧录到多块会导致同 ID 会话相互接管。
 
 首次无 Wi-Fi 配置时启动 Gateway-<芯片ID> 热点，密码 setup8266。手机连接后手动打开 http://192.168.4.1，填写 2.4GHz Wi-Fi 名称/密码，保存后自动重启，配置保存在 LittleFS；长按 FLASH（GPIO0）5 秒重新配网（正常启动后操作，不在上电时按住）。配网页只允许从 AP 接口访问；正常模式关闭热点和配网页。NTP 时间同步成功后才尝试 TLS。
 
@@ -41,3 +41,5 @@ python -m esptool --chip esp8266 --port COM3 --baud 115200 write_flash --flash_m
 ```
 
 将 COM3 换成实际串口。此命令不要求额外 bootloader/分区文件。其他板型尤其 ESP-01 1MB 不要直接使用此构建。当前只有交叉编译验证，配网、lwIP 半关闭、证书和 Wi-Fi 仍需实物联调；不是已通过实机验收的固件。
+
+2026-11-08 隧道切换到独立的 30 年自签证书（到 2056-11-08），新固件与私有源码包已更新信任证书；旧 BIN 不再匹配，必须重新烧录。Nginx 保持原证书和配置。公开 config.example.h 的证书也是占位内容，不能原样运行。
