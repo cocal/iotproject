@@ -2,6 +2,8 @@
 
 主程序：src/main.cpp。PlatformIO 固定 espressif8266 4.2.1 / Arduino Core 3.1.2 / ArduinoJson 6.21.5；默认 NodeMCU ESP-12E、4MB Flash、160MHz、115200 串口。代码已编译通过，尚无实物板联调，不表示性能或长期稳定性已验收。
 
+Windows 7 32 位交付采用 Arduino IDE 1.8.19 的 .ino + 完整 ZIP，详见 ARDUINO-WIN7.md。tools/package_arduino.py 复用主程序生成同名 sketch，把所需 ArduinoJson 头文件一起打包，无需安装额外库。已用 Linux 上的 Arduino 1.8.19 arduino-builder + Core 3.1.2 编译通过，未在 Windows 7 真机上测试。公开模板不含密钥；--config 可生成私有专属包，禁止把它放公开站点。
+
 ## 构建
 
 复制 include/config.example.h 为 include/config.h，填写 Wi-Fi、独立设备凭据、允许的 LAN 网段/端口。config.h 已被 Git 忽略；不能把设备密钥提交到仓库或公开分发站点。示例内嵌的是服务器公开信任证书，不含私钥。

@@ -1,0 +1,402 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ESP8266 烧录说明 · 打印网关</title>
+<style>body{font:16px/1.8 system-ui,sans-serif;margin:35px auto;padding:0 20px;max-width:1000px;color:#243247;background:#f7f9fc}section{background:white;border:1px solid #dde4ef;padding:24px;margin:20px 0;border-radius:12px}a{color:#1759b6}pre{overflow:auto;max-height:580px;background:#172236;color:#e5edf8;padding:20px;border-radius:8px;font:13px/1.6 monospace}table{border-collapse:collapse;width:100%}td,th{padding:8px;border-bottom:1px solid #ddd;text-align:left}.button{display:inline-block;background:#1759b6;color:white;padding:8px 16px;border-radius:6px;margin:4px}code{font-family:monospace}</style>
+<a href="/">← 返回方案文档</a><h1>ESP8266 通用 TCP 网关 · Arduino 烧录</h1>
+<section id="esp8266"><h2>ESP8266-12E/F：Windows 7 32 位</h2>
+<p>解压 ZIP，打开同名目录中的 .ino，点击验证、上传。无需安装 PlatformIO 或额外第三方库，ArduinoJson 源码已随包提供，保持目录完整。</p>
+<a class="button" href="files/printer-tunnel-arduino-win7.zip" download>下载 Arduino ZIP（公开模板）</a>
+<a href="files/printer_tunnel_esp8266.ino" download>查看主 .ino</a> · <a href="files/README-WIN7.md" download>下载操作说明</a>
+<p>公开模板的 DEVICE_ID / DEVICE_KEY 为占位符，需要填写服务器分配的设备凭据。私发的 gateway-esp8266-1 专属 ZIP 已填好凭据，不在公开网站提供。仅下载 .ino 不能替代完整 ZIP 中的配套头文件。</p></section>
+<section><h2>1. 准备 Arduino 环境</h2><ol>
+<li>安装 <a href="https://downloads.arduino.cc/arduino-1.8.19-windows.zip">Arduino IDE 1.8.19 Windows ZIP</a>，不使用 IDE 2.x。</li>
+<li>首选项 → 附加开发板管理器网址：<code>https://arduino.esp8266.com/stable/package_esp8266com_index.json</code></li>
+<li>安装 esp8266 by ESP8266 Community <strong>3.1.2</strong>。官方包索引提供 32 位 Windows 工具；不需要自行装 Python。</li>
+<li>安装 USB-TTL 芯片对应的 Windows 7 32 位串口驱动。</li></ol>
+<p>参考项目使用的 Core 2.3.0/axTLS 旧入口与本项目不同；本项目保留 TLS 1.2 和指定证书验证，不开放 TLS 1.0 兼容端口。Windows 7 真机与驱动尚未现场验证。</p></section>
+<section><h2>2. 编译和上传</h2><table><tr><th>菜单</th><th>选择</th></tr>
+<tr><td>开发板</td><td>NodeMCU 1.0 (ESP-12E Module)，4MB Flash</td></tr><tr><td>CPU Frequency</td><td>160MHz</td></tr><tr><td>Flash Size</td><td>4MB，1MB FS</td></tr><tr><td>Flash Mode / Frequency（若显示）</td><td>DIO / 40MHz</td></tr><tr><td>Upload Speed</td><td>115200</td></tr><tr><td>Port</td><td>实际 COM 端口</td></tr></table>
+<p>先验证再上传。裸 ESP-12F 需要 3.3V 稳定供电、USB-TTL；GPIO0 接地后复位进入下载，完成后松开 GPIO0 并重启。ESP-01 1MB 等其他板型不能直接照此配置。</p></section>
+<section><h2>3. 手机配置 Wi-Fi</h2><ol><li>连接热点 <strong>Gateway-xxxx</strong>，密码 <strong>setup8266</strong>。</li><li>打开 <strong>http://192.168.4.1</strong>，填 2.4GHz Wi-Fi，保存后设备自动重启。</li><li>串口 115200 观察 <code>Tunnel online</code>。正常启动后长按 FLASH 5 秒可重新配网。</li></ol>
+<p>设备需先完成 NTP 对时才能验证证书。隧道连接到 SERVER_IP_REDACTED:9443；上线不代表已绑定打印机，VPS 真实目标映射与自动打印投递仍需配置/接入。固件已编译，尚无板卡实测。</p></section>
+<section><h2>4. 完整程序（公开模板）</h2><details><summary>展开 .ino 源码</summary><pre><code>#include &lt;Arduino.h&gt;
+#include &lt;ESP8266WiFi.h&gt;
+#include &lt;WiFiClientSecureBearSSL.h&gt;
+#include &quot;ArduinoJson.h&quot;
+#include &lt;ESP8266WebServer.h&gt;
+#include &lt;LittleFS.h&gt;
+#include &lt;time.h&gt;
+extern &quot;C&quot; {
+#include &lt;lwip/tcp.h&gt;
+}
+// Copy to config.h locally; never commit Wi-Fi password or device credential.
+#define WIFI_SSID &quot;YOUR_WIFI&quot;
+#define WIFI_PASSWORD &quot;YOUR_WIFI_PASSWORD&quot;
+// Must match the server certificate SAN. Prefer a DNS hostname.
+#define TUNNEL_HOST &quot;SERVER_IP_REDACTED&quot;
+#define TUNNEL_PORT 9443
+#define DEVICE_ID &quot;YOUR_DEVICE_ID&quot;
+#define DEVICE_KEY &quot;YOUR_INDEPENDENT_DEVICE_KEY&quot;
+// Allowed local targets; adjust to the actual LAN. A zero port allows all TCP ports.
+#define ALLOW_NETWORK &quot;auto&quot;
+#define ALLOW_NETMASK &quot;255.255.255.0&quot;
+#define ALLOW_PORT 0
+// Copy the PUBLIC trusted-server.crt contents here (never its private key).
+static const char TRUSTED_CERT[] PROGMEM = R&quot;PEM(
+-----BEGIN CERTIFICATE-----
+MIIDxDCCAqygAwIBAgIUGEu1xuNScgOXJn7RMOEqH9TPfzEwDQYJKoZIhvcNAQEL
+BQAwQDELMAkGA1UEBhMCQ04xFDASBgNVBAoMC0lvVCBNb25pdG9yMRswGQYDVQQD
+DBJpb3Qub2hteXNraWxscy50b3AwHhcNMjYwODMwMDQ1NzEyWhcNMzYwODI3MDQ1
+NzEyWjBAMQswCQYDVQQGEwJDTjEUMBIGA1UECgwLSW9UIE1vbml0b3IxGzAZBgNV
+BAMMEmlvdC5vaG15c2tpbGxzLnRvcDCCASIwDQYJKoZIhvcNAQEBBQADggEPADCC
+AQoCggEBANbVbPAynlCwRw4BFHwHz49trkpuw+M5S4LOBPn+FEwgsFjR6t3h4atk
+32vX1H3N+Emkk13LQEziyq4ntV4RlUTGXweE2SUhZrRlWLIlhEPDtm2Bxknw64DM
+lpXpOpdSFlvzkXigaLuw+peIfH42lhbuMZgfDYvYqc+tbi/wHoXliHRL3WHTMAQM
+qhoyn+Ik1S1/qrMzM5ozYpvg9zdW6qIXZKhGAxWZBwNwAQe5W7JiX+gp6sM7RMvG
+vmh6dpPKTiNkqleSmCZQNAs7ZjReFB2/z98sJ++YyTBT7Zw2oxrfOIz6ZLFIAJJS
+fs4mYZ3BsLuFfEPL0QaHILCuKpjxCx0CAwEAAaOBtTCBsjAdBgNVHQ4EFgQU42M8
+XnBhjc4ypOyLFQqJvmFqZ7cwHwYDVR0jBBgwFoAU42M8XnBhjc4ypOyLFQqJvmFq
+Z7cwDwYDVR0TAQH/BAUwAwEB/zA6BgNVHREEMzAxghJpb3Qub2hteXNraWxscy50
+b3CCCWxvY2FsaG9zdIcEfwAAAYcECgIIEIcEwJCO7TAOBgNVHQ8BAf8EBAMCBaAw
+EwYDVR0lBAwwCgYIKwYBBQUHAwEwDQYJKoZIhvcNAQELBQADggEBAJUhFmMga3Et
+kBXpnTsTqHNcGMlql4e/XqKnAHzJmk4vWcLERjt7qFGcLJfaK1JZ2BgPQlrEJn4k
+7gWauot0/Dt1GYYL/6Jo+H1S0Fygl2yJPYlh9qaBBtfHzI/3KX5BDYchphieUr74
+UxJXV77uQlnHQXm8ZUo7C5Endf5yUbypcJ4k3Sc74/Iob53n/ze3pAUZcMsZaXag
+jJDEA1UJGxOeG0L+e9LNidJDzfJpFON4GMLVXV5iSFEW7aG8cgr3P7aS759mSUsx
+biTMgtZgTXbeifgBrDXLgl07avSHU9APW4lhYrm+J+Hxh2rDDEAefqDfEdsBX9hK
+MDB9SzSxvU0=
+-----END CERTIFICATE-----
+)PEM&quot;;
+
+
+// Protocol v1: bounded frames, a single LAN socket, no print/scanner semantics.
+constexpr uint8_t AUTH=1, AUTH_OK=2, AUTH_ERROR=3, OPEN=16, OPEN_OK=17, OPEN_ERROR=18,
+    DATA=32, WINDOW=33, FIN=34, STREAM_CLOSED=35, RESET=36, PING=48, PONG=49;
+constexpr size_t CHUNK=1024, CREDIT=4096;
+BearSSL::WiFiClientSecure tunnel;
+BearSSL::X509List trust(TRUSTED_CERT);
+ESP8266WebServer setupWeb(80);
+bool setupMode=false;
+String configuredSsid,configuredPassword;
+tcp_pcb *target=nullptr;
+uint32_t sid=0,lastSid=0,credit=0,toTargetCredit=CREDIT,unacked=0,returnedCredit=0;
+uint32_t lastPong=0,lastPing=0,nonce=0,pingNonces[4]={},pingCount=0;
+uint32_t connectAt=0,connectTimeout=1500,activity=0,closeAt=0,idleMs=120000;
+uint32_t onlineAt=0,nextAttempt=0,backoff=1000;
+bool notified=false;
+bool online=false,connecting=false,opened=false,remoteFin=false,localFin=false,writeClosed=false;
+bool targetError=false,targetEof=false,protocolBad=false;
+// LAN -&gt; TLS ring; bytes are acknowledged with tcp_recved only after TLS write.
+uint8_t ring[CREDIT];size_t ringHead=0,ringSize=0;
+uint8_t outbound[CREDIT];size_t outHead=0,outSize=0;
+uint8_t header[16],payload[CHUNK];size_t headerUsed=0,payloadUsed=0,payloadLength=0;
+uint8_t incomingType=0;uint32_t incomingSid=0;
+
+uint32_t read32(const uint8_t *p) {return uint32_t(p[0])&lt;&lt;24|uint32_t(p[1])&lt;&lt;16|uint32_t(p[2])&lt;&lt;8|p[3];}
+void put32(uint8_t *p,uint32_t n){p[0]=n&gt;&gt;24;p[1]=n&gt;&gt;16;p[2]=n&gt;&gt;8;p[3]=n;}
+bool elapsed(uint32_t since,uint32_t duration){return uint32_t(millis()-since)&gt;=duration;}
+bool known(uint8_t t){return t==AUTH||t==AUTH_OK||t==AUTH_ERROR||t==OPEN||t==OPEN_OK||t==OPEN_ERROR||t==DATA||t==WINDOW||t==FIN||t==STREAM_CLOSED||t==RESET||t==PING||t==PONG;}
+
+bool sendFrame(uint8_t type,uint32_t stream,const uint8_t *bytes=nullptr,size_t length=0){
+    // One loop owns TLS. BearSSL handles partial TCP/TLS writes internally.
+    uint8_t out[16+CHUNK];out[0]=&#x27;I&#x27;;out[1]=&#x27;T&#x27;;out[2]=1;out[3]=type;
+    put32(out+4,stream);put32(out+8,length);put32(out+12,0);
+    if(length)memcpy(out+16,bytes,length);
+    size_t offset=0;uint32_t started=millis();
+    while(offset&lt;16+length){
+        if(!tunnel.connected()||elapsed(started,5000))return false;
+        size_t n=tunnel.write(out+offset,16+length-offset);
+        if(!n)return false;
+        offset+=n;yield();
+    }
+    return true;
+}
+bool sendJson(uint8_t type,uint32_t stream,const JsonDocument &amp;doc){
+    uint8_t bytes[512];size_t n=measureJson(doc);
+    if(n&gt;sizeof(bytes))return false;
+    serializeJson(doc,bytes,sizeof(bytes));return sendFrame(type,stream,bytes,n);
+}
+bool codeFrame(uint8_t type,uint32_t stream,const char *code){
+    StaticJsonDocument&lt;128&gt; doc;doc[&quot;code&quot;]=code;return sendJson(type,stream,doc);
+}
+void clearTarget(){
+    if(target){tcp_arg(target,nullptr);tcp_recv(target,nullptr);tcp_sent(target,nullptr);tcp_err(target,nullptr);tcp_abort(target);target=nullptr;}
+    sid=0;opened=connecting=notified=false;remoteFin=localFin=writeClosed=false;
+    targetError=targetEof=false;ringHead=ringSize=outHead=outSize=0;unacked=returnedCredit=0;toTargetCredit=CREDIT;closeAt=0;
+}
+void disconnectTunnel(){
+    clearTarget();tunnel.stop();online=false;headerUsed=payloadUsed=0;protocolBad=false;
+    lastSid=0;pingCount=0;
+    nextAttempt=millis()+backoff+random(0,251);backoff=min(backoff*2,uint32_t(30000));
+    Serial.println(F(&quot;Tunnel offline; reconnect scheduled&quot;));
+}
+void resetFlow(const char *code){
+    uint32_t id=sid;if(!id)return;
+    clearTarget();
+    if(!codeFrame(RESET,id,code)||!sendFrame(STREAM_CLOSED,id))protocolBad=true;
+}
+
+err_t targetReceive(void *,tcp_pcb *,pbuf *p,err_t error){
+    if(error!=ERR_OK){targetError=true;return error;}
+    if(!p){targetEof=true;return ERR_OK;}
+    if(p-&gt;tot_len&gt;CREDIT-ringSize)return ERR_MEM; // lwIP retains pbuf and retries
+    size_t tail=(ringHead+ringSize)%CREDIT;
+    for(pbuf *q=p;q;q=q-&gt;next){
+        const uint8_t *data=static_cast&lt;const uint8_t*&gt;(q-&gt;payload);
+        for(size_t i=0;i&lt;q-&gt;len;i++){ring[tail]=data[i];tail=(tail+1)%CREDIT;}
+    }
+    ringSize+=p-&gt;tot_len;pbuf_free(p);activity=millis();return ERR_OK;
+}
+err_t targetSent(void *,tcp_pcb *,u16_t count){
+    if(count&gt;unacked){targetError=true;return ERR_OK;}
+    unacked-=count;returnedCredit+=count;activity=millis();return ERR_OK;
+}
+void targetFailed(void *,err_t){target=nullptr;targetError=true;}
+err_t targetConnected(void *,tcp_pcb *,err_t error){
+    connecting=false;if(error!=ERR_OK){targetError=true;return error;}
+    opened=true;activity=millis();return ERR_OK;
+}
+
+bool allowed(IPAddress ip,uint16_t port){
+    IPAddress net,mask;
+    if(strcmp(ALLOW_NETWORK,&quot;auto&quot;)==0){net=WiFi.localIP();mask=WiFi.subnetMask();}
+    else if(!net.fromString(ALLOW_NETWORK)||!mask.fromString(ALLOW_NETMASK))return false;
+    uint32_t v=uint32_t(ip),m=uint32_t(mask),n=uint32_t(net);
+    return ip[0]!=0&amp;&amp;ip[0]!=127&amp;&amp;ip[0]&lt;224&amp;&amp;(v&amp;m)==(n&amp;m)
+        &amp;&amp;(v&amp;~m)!=0&amp;&amp;(v&amp;~m)!=~m &amp;&amp; (ALLOW_PORT==0||port==ALLOW_PORT);
+}
+bool integer(JsonVariantConst v,uint32_t low,uint32_t high){return v.is&lt;uint32_t&gt;()&amp;&amp;v.as&lt;uint32_t&gt;()&gt;=low&amp;&amp;v.as&lt;uint32_t&gt;()&lt;=high;}
+
+void dispatch(){
+    StaticJsonDocument&lt;1536&gt; doc;
+    if(incomingType!=DATA &amp;&amp; incomingType!=FIN &amp;&amp; incomingType!=STREAM_CLOSED){
+        if(deserializeJson(doc,payload,payloadLength)||!doc.is&lt;JsonObject&gt;()){protocolBad=true;return;}
+    }
+    if(!online){
+        if(incomingType!=AUTH_OK||!integer(doc[&quot;heartbeat_sec&quot;],30,30)||!integer(doc[&quot;timeout_sec&quot;],90,90)
+            ||!integer(doc[&quot;initial_window&quot;],CREDIT,CREDIT)||!doc[&quot;session_id&quot;].is&lt;const char*&gt;()){
+            protocolBad=true;return;
+        }
+        online=true;onlineAt=lastPong=millis();lastPing=millis()-30000;
+        Serial.printf(&quot;Tunnel online; free heap=%u\n&quot;,ESP.getFreeHeap());return;
+    }
+    if(incomingType==PONG){
+        if(!integer(doc[&quot;nonce&quot;],0,UINT32_MAX)){protocolBad=true;return;}
+        uint32_t value=doc[&quot;nonce&quot;];
+        bool found=false;
+        for(uint32_t i=0;i&lt;pingCount;i++)if(pingNonces[i]==value){
+            for(uint32_t j=i+1;j&lt;pingCount;j++){pingNonces[j-1]=pingNonces[j];}
+            --pingCount;found=true;break;
+        }
+        if(!found){protocolBad=true;return;}lastPong=millis();return;
+    }
+    if(incomingType==OPEN){
+        if(incomingSid&lt;=lastSid){protocolBad=true;return;}lastSid=incomingSid;
+        if(sid){if(!codeFrame(OPEN_ERROR,incomingSid,&quot;BUSY&quot;))protocolBad=true;return;}
+        IPAddress ip;
+        if(!doc[&quot;target_ip&quot;].is&lt;const char*&gt;()||!ip.fromString(doc[&quot;target_ip&quot;].as&lt;const char*&gt;())
+            ||!integer(doc[&quot;target_port&quot;],1,65535)||!integer(doc[&quot;initial_window&quot;],CREDIT,CREDIT)
+            ||!integer(doc[&quot;connect_timeout_ms&quot;],200,5000)||!integer(doc[&quot;idle_timeout_sec&quot;],5,3600)){
+            protocolBad=true;return;
+        }
+        uint16_t port=doc[&quot;target_port&quot;];
+        if(!allowed(ip,port)){if(!codeFrame(OPEN_ERROR,incomingSid,&quot;DENIED&quot;))protocolBad=true;return;}
+        target=tcp_new();
+        if(!target){if(!codeFrame(OPEN_ERROR,incomingSid,&quot;UNREACHABLE&quot;))protocolBad=true;return;}
+        sid=incomingSid;credit=CREDIT;toTargetCredit=CREDIT;
+        connectTimeout=doc[&quot;connect_timeout_ms&quot;];idleMs=doc[&quot;idle_timeout_sec&quot;].as&lt;uint32_t&gt;()*1000;
+        connecting=true;connectAt=activity=millis();tcp_nagle_disable(target);
+        tcp_arg(target,nullptr);tcp_recv(target,targetReceive);tcp_sent(target,targetSent);tcp_err(target,targetFailed);
+        ip_addr_t address;IP_ADDR4(&amp;address,ip[0],ip[1],ip[2],ip[3]);
+        if(tcp_connect(target,&amp;address,port,targetConnected)!=ERR_OK)targetError=true;
+        return;
+    }
+    if(!sid || incomingSid!=sid){
+        // Already in flight before STREAM_CLOSED reached the peer.
+        if(incomingSid==lastSid&amp;&amp;(incomingType==WINDOW||incomingType==RESET))return;
+        protocolBad=true;return;
+    }
+    if(incomingType==RESET){uint32_t id=sid;clearTarget();if(!sendFrame(STREAM_CLOSED,id))protocolBad=true;return;}
+    if(!opened){protocolBad=true;return;}
+    switch(incomingType){
+    case DATA:{
+        if(remoteFin||payloadLength&gt;toTargetCredit){protocolBad=true;return;}
+        if(payloadLength&gt;CREDIT-outSize){protocolBad=true;return;}
+        for(size_t i=0;i&lt;payloadLength;i++)outbound[(outHead+outSize+i)%CREDIT]=payload[i];
+        outSize+=payloadLength;toTargetCredit-=payloadLength;activity=millis();break;
+    }
+    case WINDOW:{
+        if(!integer(doc[&quot;credit&quot;],1,CREDIT)||credit+doc[&quot;credit&quot;].as&lt;uint32_t&gt;()&gt;CREDIT){protocolBad=true;return;}
+        credit+=doc[&quot;credit&quot;].as&lt;uint32_t&gt;();break;
+    }
+    case FIN:
+        if(remoteFin){protocolBad=true;return;}remoteFin=true;if(!closeAt)closeAt=millis();break;
+    default:protocolBad=true;
+    }
+}
+void readTunnel(){
+    // Bounded work per loop leaves time for LAN callbacks and heartbeats.
+    for(int frames=0;frames&lt;8 &amp;&amp; tunnel.available();){
+        if(headerUsed&lt;16){
+            int n=tunnel.read(header+headerUsed,16-headerUsed);if(n&lt;=0)return;headerUsed+=n;
+            if(headerUsed&lt;16)return;
+            incomingType=header[3];incomingSid=read32(header+4);payloadLength=read32(header+8);
+            bool control=incomingType&lt;=3||incomingType&gt;=48;
+            if(header[0]!=&#x27;I&#x27;||header[1]!=&#x27;T&#x27;||header[2]!=1||read32(header+12)!=0||!known(incomingType)
+                ||(control!=(incomingSid==0))||payloadLength&gt;(incomingType==DATA?CHUNK:512)
+                ||(incomingType==DATA&amp;&amp;payloadLength==0)||((incomingType==FIN||incomingType==STREAM_CLOSED)&amp;&amp;payloadLength)){
+                protocolBad=true;return;
+            }
+        }
+        if(payloadUsed&lt;payloadLength){int n=tunnel.read(payload+payloadUsed,payloadLength-payloadUsed);if(n&lt;=0)return;payloadUsed+=n;}
+        if(payloadUsed&lt;payloadLength)return;
+        dispatch();headerUsed=payloadUsed=0;++frames;if(protocolBad)return;
+    }
+}
+void serviceTarget(){
+    if(!sid)return;
+    if(targetError|| (connecting&amp;&amp;elapsed(connectAt,connectTimeout))){
+        if(!opened){uint32_t id=sid;bool timed=connecting&amp;&amp;!targetError;clearTarget();if(!codeFrame(OPEN_ERROR,id,timed?&quot;CONNECT_TIMEOUT&quot;:&quot;REFUSED&quot;))protocolBad=true;}
+        else {resetFlow(&quot;TARGET_IO&quot;);}
+        return;
+    }
+    if(!opened)return;
+    // OPEN_OK must precede any data. Callback only sets flags, never touches TLS.
+    if(!notified){StaticJsonDocument&lt;96&gt; doc;doc[&quot;initial_window&quot;]=CREDIT;
+        if(!sendJson(OPEN_OK,sid,doc)){protocolBad=true;return;}notified=true;}
+    if(!target||targetError)return;
+    if(returnedCredit){uint32_t n=returnedCredit;returnedCredit=0;toTargetCredit+=n;
+        StaticJsonDocument&lt;96&gt; doc;doc[&quot;credit&quot;]=n;if(!sendJson(WINDOW,sid,doc)){protocolBad=true;return;}}
+    if(ringSize&amp;&amp;credit){
+        size_t n=min(min(ringSize,size_t(credit)),min(CHUNK,CREDIT-ringHead));
+        if(!sendFrame(DATA,sid,ring+ringHead,n)){protocolBad=true;return;}
+        ringHead=(ringHead+n)%CREDIT;ringSize-=n;credit-=n;
+        if(target)tcp_recved(target,n);
+    }
+    if(outSize&amp;&amp;target){
+        size_t n=min(min(outSize,CREDIT-outHead),size_t(tcp_sndbuf(target)));
+        if(n){
+            err_t e=tcp_write(target,outbound+outHead,n,TCP_WRITE_FLAG_COPY);
+            if(e==ERR_OK){outHead=(outHead+n)%CREDIT;outSize-=n;unacked+=n;tcp_output(target);}
+            else if(e!=ERR_MEM){resetFlow(&quot;TARGET_IO&quot;);return;}
+        }
+    }
+    if(remoteFin&amp;&amp;!writeClosed&amp;&amp;unacked==0&amp;&amp;outSize==0){
+        err_t e=tcp_shutdown(target,0,1);if(e==ERR_OK)writeClosed=true;else if(e!=ERR_MEM){resetFlow(&quot;TARGET_IO&quot;);return;}
+    }
+    if(targetEof&amp;&amp;!ringSize&amp;&amp;!localFin){
+        if(!sendFrame(FIN,sid)){protocolBad=true;return;}localFin=true;if(!closeAt)closeAt=millis();
+    }
+    if(localFin&amp;&amp;writeClosed&amp;&amp;unacked==0&amp;&amp;target){
+        // Do not let callbacks reference a PCB that tcp_close frees.
+        tcp_recv(target,nullptr);tcp_sent(target,nullptr);tcp_err(target,nullptr);
+        err_t e=tcp_close(target);
+        if(e==ERR_OK){target=nullptr;uint32_t id=sid;clearTarget();if(!sendFrame(STREAM_CLOSED,id))protocolBad=true;}
+        else {tcp_recv(target,targetReceive);tcp_sent(target,targetSent);tcp_err(target,targetFailed);}
+    }
+    if(sid &amp;&amp; closeAt&amp;&amp;elapsed(closeAt,10000))resetFlow(&quot;CLOSE_TIMEOUT&quot;);
+    else if(sid&amp;&amp;elapsed(activity,idleMs))resetFlow(&quot;IDLE_TIMEOUT&quot;);
+}
+void connectTunnel(){
+    Serial.println(F(&quot;Connecting TLS tunnel&quot;));
+    tunnel.setTrustAnchors(&amp;trust);tunnel.setSSLVersion(BR_TLS12,BR_TLS12);
+    // Keep the default receive buffer: a 1 KiB app frame does NOT cap TLS records.
+    tunnel.setTimeout(5000);
+    IPAddress address;
+    // BearSSL validates dNSName, not iPAddress SAN. For an IP endpoint use ONLY
+    // this server&#x27;s exact self-signed cert as trust anchor (not a broad CA).
+    bool connected=address.fromString(TUNNEL_HOST)
+        ? tunnel.connect(address,TUNNEL_PORT) : tunnel.connect(TUNNEL_HOST,TUNNEL_PORT);
+    if(!connected){Serial.printf(&quot;TLS failure code=%d\n&quot;,tunnel.getLastSSLError());disconnectTunnel();return;}
+    StaticJsonDocument&lt;768&gt; doc;
+    doc[&quot;device_id&quot;]=DEVICE_ID;doc[&quot;credential&quot;]=DEVICE_KEY;doc[&quot;firmware&quot;]=&quot;esp8266-tunnel-v1&quot;;
+    doc[&quot;lan_ip&quot;]=WiFi.localIP().toString();doc[&quot;netmask&quot;]=WiFi.subnetMask().toString();doc[&quot;gateway&quot;]=WiFi.gatewayIP().toString();
+    if(!sendJson(AUTH,0,doc)){disconnectTunnel();return;}connectAt=millis();
+}
+void startSetup(){
+    setupMode=true;WiFi.mode(WIFI_AP_STA);
+    String name=String(&quot;Gateway-&quot;)+String(ESP.getChipId(),HEX);
+    WiFi.softAP(name.c_str(),&quot;setup8266&quot;);
+    setupWeb.on(&quot;/&quot;,HTTP_GET,[]{
+        if(setupWeb.client().localIP()!=WiFi.softAPIP()){
+            setupWeb.send(403,&quot;text/plain&quot;,&quot;Connect to setup hotspot&quot;);return;
+        }
+        setupWeb.sendHeader(&quot;Cache-Control&quot;,&quot;no-store&quot;);
+        setupWeb.send(200,&quot;text/html; charset=utf-8&quot;,
+            &quot;&lt;!doctype html&gt;&lt;meta name=&#x27;viewport&#x27; content=&#x27;width=device-width,initial-scale=1&#x27;&gt;&quot;
+            &quot;&lt;h2&gt;ESP8266 Wi-Fi 配置&lt;/h2&gt;&lt;form action=&#x27;/save&#x27; method=&#x27;post&#x27;&gt;&quot;
+            &quot;&lt;p&gt;Wi-Fi 名称 &lt;input name=&#x27;ssid&#x27; maxlength=&#x27;32&#x27; required&gt;&lt;/p&gt;&quot;
+            &quot;&lt;p&gt;Wi-Fi 密码 &lt;input name=&#x27;password&#x27; type=&#x27;password&#x27; maxlength=&#x27;64&#x27;&gt;&lt;/p&gt;&quot;
+            &quot;&lt;button&gt;保存并重启&lt;/button&gt;&lt;/form&gt;&quot;);
+    });
+    setupWeb.on(&quot;/save&quot;,HTTP_POST,[]{
+        if(setupWeb.client().localIP()!=WiFi.softAPIP()){
+            setupWeb.send(403,&quot;text/plain&quot;,&quot;Connect to setup hotspot&quot;);return;
+        }
+        if(setupWeb.header(&quot;Origin&quot;).length() &amp;&amp; setupWeb.header(&quot;Origin&quot;)!=&quot;http://192.168.4.1&quot;){
+            setupWeb.send(403,&quot;text/plain&quot;,&quot;Invalid origin&quot;);return;
+        }
+        String ssid=setupWeb.arg(&quot;ssid&quot;),password=setupWeb.arg(&quot;password&quot;);
+        if(ssid.length()==0||ssid.length()&gt;32||password.length()&gt;64){
+            setupWeb.send(400,&quot;text/plain&quot;,&quot;Invalid Wi-Fi settings&quot;);return;
+        }
+        StaticJsonDocument&lt;256&gt; doc;doc[&quot;ssid&quot;]=ssid;doc[&quot;password&quot;]=password;
+        File file=LittleFS.open(&quot;/wifi.json&quot;,&quot;w&quot;);
+        if(!file){setupWeb.send(500,&quot;text/plain&quot;,&quot;Cannot save configuration&quot;);return;}
+        serializeJson(doc,file);file.close();
+        setupWeb.send(200,&quot;text/html; charset=utf-8&quot;,&quot;已保存，设备正在重启。请切回原 Wi-Fi。&quot;);
+        delay(300);ESP.restart();
+    });
+    setupWeb.collectHeaders(&quot;Origin&quot;);
+    setupWeb.begin();
+    Serial.printf(&quot;Setup AP: %s; open http://192.168.4.1; hold FLASH 5 seconds to reconfigure\n&quot;,name.c_str());
+}
+void setup(){
+    Serial.begin(115200);pinMode(0,INPUT_PULLUP);
+    WiFi.persistent(false);WiFi.mode(WIFI_STA);WiFi.setAutoReconnect(true);
+    if(!LittleFS.begin()){startSetup();return;}
+    File saved=LittleFS.open(&quot;/wifi.json&quot;,&quot;r&quot;);
+    if(saved){
+        StaticJsonDocument&lt;256&gt; doc;
+        if(!deserializeJson(doc,saved)){
+            configuredSsid=doc[&quot;ssid&quot;].as&lt;String&gt;();configuredPassword=doc[&quot;password&quot;].as&lt;String&gt;();
+        }
+        saved.close();
+    }
+    if(configuredSsid.length()==0 &amp;&amp; strcmp(WIFI_SSID,&quot;YOUR_WIFI&quot;)!=0){
+        configuredSsid=WIFI_SSID;configuredPassword=WIFI_PASSWORD;
+    }
+    if(configuredSsid.length()==0){startSetup();return;}
+    WiFi.begin(configuredSsid.c_str(),configuredPassword.c_str());randomSeed(ESP.getCycleCount());
+    // Real time is required for X.509 validity checking; no insecure fallback.
+    configTime(0,0,&quot;pool.ntp.org&quot;,&quot;time.cloudflare.com&quot;);
+}
+
+void loop(){
+    static uint32_t pressedAt=0;
+    if(digitalRead(0)==LOW){
+        if(!pressedAt)pressedAt=millis();
+        if(!setupMode&amp;&amp;elapsed(pressedAt,5000)){disconnectTunnel();startSetup();}
+    }else pressedAt=0;
+    if(setupMode){setupWeb.handleClient();delay(1);return;}
+    if(WiFi.status()!=WL_CONNECTED){if(tunnel.connected()||sid)disconnectTunnel();delay(10);return;}
+    if(time(nullptr)&lt;1700000000){delay(10);return;}
+    if(!tunnel.connected()){
+        if(online||sid)disconnectTunnel();
+        if(int32_t(millis()-nextAttempt)&gt;=0){connectTunnel();}
+        delay(1);return;
+    }
+    readTunnel();serviceTarget();
+    if(online){
+        if(elapsed(onlineAt,60000))backoff=1000;
+        if(elapsed(lastPong,90000)){disconnectTunnel();return;}
+        if(elapsed(lastPing,30000)){
+            if(pingCount&gt;=4){disconnectTunnel();return;}
+            StaticJsonDocument&lt;96&gt; doc;doc[&quot;nonce&quot;]=++nonce;
+            pingNonces[pingCount++]=nonce;lastPing=millis();if(!sendJson(PING,0,doc))protocolBad=true;
+        }
+    }else if(elapsed(connectAt,10000))protocolBad=true;
+    if(protocolBad){disconnectTunnel();}
+    delay(1);
+}
+</code></pre></details></section>
+</html>
