@@ -14,6 +14,7 @@ import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.InetSocketAddress;
 import java.nio.charset.Charset;
 import java.security.MessageDigest;
 import java.util.ArrayList;
@@ -32,17 +33,20 @@ public class LegacyTcpReceiver {
     private final LegacyInvoiceParser parser;
     private final EscPosReceiptRenderer renderer;
     private final int port;
+    private final String bind;
     private final AtomicBoolean running = new AtomicBoolean();
     private final ExecutorService clients = Executors.newCachedThreadPool();
     private volatile ServerSocket serverSocket;
 
     public LegacyTcpReceiver(PrintJobRepository jobs, LegacyInvoiceParser parser,
                              EscPosReceiptRenderer renderer,
-                             @Value("${printer.legacy.port:9100}") int port) {
+                             @Value("${printer.legacy.port:9100}") int port,
+                             @Value("${printer.legacy.bind:0.0.0.0}") String bind) {
         this.jobs = jobs;
         this.parser = parser;
         this.renderer = renderer;
         this.port = port;
+        this.bind = bind;
     }
 
     @EventListener(ApplicationReadyEvent.class)
@@ -56,7 +60,8 @@ public class LegacyTcpReceiver {
     }
 
     private void acceptConnections() {
-        try (ServerSocket socket = new ServerSocket(port)) {
+        try (ServerSocket socket = new ServerSocket()) {
+            socket.bind(new InetSocketAddress(bind,port));
             serverSocket = socket;
             log.info("Legacy printer TCP receiver listening on port {}", port);
             while (running.get()) {

@@ -14,6 +14,7 @@ printer:
   api:
     key: ${PRINT_API_KEY:}
   legacy:
+    bind: ${LEGACY_TCP_BIND:0.0.0.0}
     port: ${LEGACY_TCP_PORT:9100}
   delivery:
     reaper-delay-ms: ${DELIVERY_REAPER_DELAY_MS:30000}
