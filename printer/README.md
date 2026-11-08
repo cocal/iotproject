@@ -8,3 +8,5 @@
 - `server/`：部署在远程主机上的服务端
 - `remote-print/`：远程打印任务、队列和打印机适配器
 
+部署组件及网络边界见 [`server/deploy/deployment.md`](server/deploy/deployment.md)。该文档不包含机器地址、端口、域名或密钥。
+
