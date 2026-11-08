@@ -21,6 +21,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 @Component
@@ -28,6 +29,9 @@ public class LegacyTcpReceiver {
     private static final Logger log = LoggerFactory.getLogger(LegacyTcpReceiver.class);
     private static final int MAX_LINES = 10_000;
     private static final int MAX_LINE_LENGTH = 16_384;
+    private static final int MAX_PAYLOAD_BYTES = 256 * 1024;
+    private static final int READ_TIMEOUT_MS = 30_000;
+    private static final int MAX_CLIENTS = 64;
 
     private final PrintJobRepository jobs;
     private final LegacyInvoiceParser parser;
@@ -35,7 +39,12 @@ public class LegacyTcpReceiver {
     private final int port;
     private final String bind;
     private final AtomicBoolean running = new AtomicBoolean();
-    private final ExecutorService clients = Executors.newCachedThreadPool();
+    private final ExecutorService clients = Executors.newFixedThreadPool(MAX_CLIENTS, runnable -> {
+        Thread thread = new Thread(runnable, "legacy-tcp-client");
+        thread.setDaemon(true);
+        return thread;
+    });
+    private final Semaphore clientSlots = new Semaphore(MAX_CLIENTS);
     private volatile ServerSocket serverSocket;
 
     public LegacyTcpReceiver(PrintJobRepository jobs, LegacyInvoiceParser parser,
@@ -66,7 +75,20 @@ public class LegacyTcpReceiver {
             log.info("Legacy printer TCP receiver listening on port {}", port);
             while (running.get()) {
                 Socket client = socket.accept();
-                clients.submit(() -> handle(client));
+                if (!clientSlots.tryAcquire()) {
+                    client.close();
+                    continue;
+                }
+                clients.submit(() -> {
+                    try {
+                        client.setSoTimeout(READ_TIMEOUT_MS);
+                        handle(client);
+                    } catch (Exception error) {
+                        log.debug("Legacy TCP connection closed: {}", error.getClass().getSimpleName());
+                    } finally {
+                        clientSlots.release();
+                    }
+                });
             }
         } catch (Exception e) {
             if (running.get()) {
@@ -80,6 +102,7 @@ public class LegacyTcpReceiver {
         List<String> lines = new ArrayList<>();
         boolean submitted = false;
         String sourceIp = socket.getInetAddress().getHostAddress();
+        int payloadBytes = 0;
         try (socket;
              BufferedReader reader = new BufferedReader(
                      new InputStreamReader(socket.getInputStream(), Charset.forName("GBK")))) {
@@ -87,6 +110,11 @@ public class LegacyTcpReceiver {
             while ((line = reader.readLine()) != null) {
                 if (line.length() > MAX_LINE_LENGTH || lines.size() >= MAX_LINES) {
                     log.warn("Rejected oversized legacy print payload from {}", socket.getRemoteSocketAddress());
+                    return;
+                }
+                payloadBytes += line.length() + 1;
+                if (payloadBytes > MAX_PAYLOAD_BYTES) {
+                    log.warn("Rejected oversized legacy print payload from {}", sourceIp);
                     return;
                 }
                 lines.add(line);
