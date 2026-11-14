@@ -14,6 +14,10 @@ import static iotproject.printer.tunnel.TunnelFrame.*;
 /** TLS sessions and explicit, loopback-only target mappings. No print semantics. */
 public final class TunnelGateway implements AutoCloseable {
     private static final Logger log=LoggerFactory.getLogger(TunnelGateway.class);
+    private static final String[] TLS12_CIPHER_SUITES={
+            "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+            "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384"
+    };
     public record Mapping(String deviceId,int localPort,String targetIp,int targetPort) {
         public Mapping {
             if(deviceId==null || !deviceId.matches("[A-Za-z0-9_.-]{1,64}") || localPort<0 || localPort>65535
@@ -31,7 +35,9 @@ public final class TunnelGateway implements AutoCloseable {
         }
     }
     private final SSLContext tls;
+    private final String[] enabledProtocols;
     private final InetSocketAddress address;
+    private final InetSocketAddress legacyAddress;
     private final BiPredicate<String,String> authenticate;
     private final List<Mapping> mappings;
     private final ConcurrentMap<String,Session> sessions=new ConcurrentHashMap<>();
@@ -43,10 +49,25 @@ public final class TunnelGateway implements AutoCloseable {
     private final Semaphore capacity;
     private final AtomicBoolean running=new AtomicBoolean();
     private volatile int port;
+    private volatile int legacyPort;
 
     public TunnelGateway(SSLContext tls,InetSocketAddress address,BiPredicate<String,String> authenticate,
                          List<Mapping> mappings,int maxConnections) {
+        this(tls,address,authenticate,mappings,maxConnections,new String[]{"TLSv1.2"});
+    }
+    public TunnelGateway(SSLContext tls,InetSocketAddress address,BiPredicate<String,String> authenticate,
+                         List<Mapping> mappings,int maxConnections,String[] enabledProtocols) {
+        this(tls,address,authenticate,mappings,maxConnections,enabledProtocols,null);
+    }
+    public TunnelGateway(SSLContext tls,InetSocketAddress address,BiPredicate<String,String> authenticate,
+                         List<Mapping> mappings,int maxConnections,String[] enabledProtocols,
+                         InetSocketAddress legacyAddress) {
         this.tls=tls; this.address=address; this.authenticate=authenticate; this.mappings=List.copyOf(mappings);
+        if(enabledProtocols==null || enabledProtocols.length!=1
+                || !(enabledProtocols[0].equals("TLSv1.2") || enabledProtocols[0].equals("TLSv1")))
+            throw new IllegalArgumentException("Only isolated TLSv1.2 or legacy TLSv1 listeners are supported");
+        this.enabledProtocols=enabledProtocols.clone();
+        this.legacyAddress=legacyAddress;
         if(maxConnections<1 || maxConnections>1024) throw new IllegalArgumentException("Invalid connection limit");
         capacity=new Semaphore(maxConnections);
     }
@@ -54,10 +75,21 @@ public final class TunnelGateway implements AutoCloseable {
         if(!running.compareAndSet(false,true)) return;
         try {
             SSLServerSocket server=(SSLServerSocket)tls.getServerSocketFactory().createServerSocket();
-            listeners.add(server); server.setEnabledProtocols(new String[]{"TLSv1.2"}); server.bind(address);
+            listeners.add(server); server.setEnabledProtocols(enabledProtocols);
+            if(enabledProtocols[0].equals("TLSv1.2")) server.setEnabledCipherSuites(TLS12_CIPHER_SUITES);
+            server.bind(address);
             port=server.getLocalPort();
             log.info("TLS tunnel listening on {}:{}",address.getHostString(),port);
             workers.execute(() -> accept(server,null));
+            if(legacyAddress!=null) {
+                SSLServerSocket legacy=(SSLServerSocket)tls.getServerSocketFactory().createServerSocket();
+                listeners.add(legacy); legacy.setEnabledProtocols(new String[]{"TLSv1"});
+                legacy.setEnabledCipherSuites(new String[]{"TLS_RSA_WITH_AES_128_CBC_SHA"});
+                legacy.bind(legacyAddress);
+                legacyPort=legacy.getLocalPort();
+                log.warn("Legacy TLS 1.0 tunnel enabled on {}:{}",legacyAddress.getHostString(),legacy.getLocalPort());
+                workers.execute(() -> accept(legacy,null));
+            }
             for(Mapping mapping:mappings) {
                 ServerSocket local=new ServerSocket(); listeners.add(local);
                 local.bind(new InetSocketAddress("127.0.0.1",mapping.localPort())); mappingPorts.add(local.getLocalPort());
@@ -67,11 +99,34 @@ public final class TunnelGateway implements AutoCloseable {
         } catch(IOException | RuntimeException e) { close(); throw e; }
     }
     public int port() {return port;}
+    public int legacyPort() {return legacyPort;}
     public int mappingPort(int index) {return mappingPorts.get(index);}
     public boolean online(String device) {return sessions.containsKey(device);}
     public boolean available(String device) {
         Session session=sessions.get(device);
         return session!=null && session.stream==null && !session.socket.isClosed();
+    }
+    public boolean hasMapping(String device) {
+        return mappings.stream().anyMatch(mapping -> mapping.deviceId().equals(device));
+    }
+    public boolean hasSingleMapping(String device) {
+        return mappings.stream().filter(mapping -> mapping.deviceId().equals(device)).count()==1;
+    }
+    public void sendRaw(String device,byte[] data) throws IOException {
+        Mapping mapping=mappings.stream().filter(item -> item.deviceId().equals(device)).findFirst()
+                .orElseThrow(() -> new IOException("No authorized printer mapping for device"));
+        if(!hasSingleMapping(device))
+            throw new IOException("Exactly one printer mapping is required for device");
+        int index=mappings.indexOf(mapping);
+        try(Socket local=new Socket()) {
+            local.connect(new InetSocketAddress("127.0.0.1",mappingPorts.get(index)),2_000);
+            local.setSoTimeout(2_000);
+            local.getOutputStream().write(data);
+            local.getOutputStream().flush();
+            local.shutdownOutput();
+            try { local.getInputStream().transferTo(OutputStream.nullOutputStream()); }
+            catch(SocketTimeoutException ignored) { /* Printer protocols commonly have no response. */ }
+        }
     }
     private void accept(ServerSocket server,Mapping mapping) {
         while(running.get()) {
@@ -93,12 +148,16 @@ public final class TunnelGateway implements AutoCloseable {
         }
     }
     private void bridge(Socket local,Mapping mapping) throws Exception {
+        bridge(local,mapping,null);
+    }
+    private void bridge(Socket local,Mapping mapping,CompletableFuture<Void> opened) throws Exception {
         Session session=sessions.get(mapping.deviceId());
-        if(session==null) return;
+        if(session==null) {if(opened!=null) opened.completeExceptionally(new IOException("Device offline"));return;}
         Stream stream=session.open(local,mapping);
-        if(stream==null) return;
+        if(stream==null) {if(opened!=null) opened.completeExceptionally(new IOException("Device busy"));return;}
         try {
             stream.opened.get(7,TimeUnit.SECONDS);
+            if(opened!=null) opened.complete(null);
             workers.execute(() -> stream.deliver());
             byte[] buffer=new byte[CHUNK];
             while(true) {
@@ -120,9 +179,44 @@ public final class TunnelGateway implements AutoCloseable {
             }
             stream.done.get();
         } catch(Exception e) {
+            if(opened!=null) opened.completeExceptionally(e);
             log.debug("Local tunnel sender stopped: {}",e.getClass().getSimpleName());
             if(e instanceof SocketException) log.debug("Local socket state: {}",e.getMessage());
             session.reset(stream,"TARGET_IO");
+        }
+    }
+    public boolean probe(String device,String targetIp,int targetPort) throws IOException {
+        exchange(device,targetIp,targetPort,new byte[0],500);
+        return true;
+    }
+    public void sendRaw(String device,String targetIp,int targetPort,byte[] data) throws IOException {
+        exchange(device,targetIp,targetPort,data,750);
+    }
+    private byte[] exchange(String device,String targetIp,int targetPort,byte[] data,int responseTimeoutMs) throws IOException {
+        Mapping target=new Mapping(device,0,targetIp,targetPort);
+        if(!available(device)) throw new IOException("Device offline or tunnel busy");
+        CompletableFuture<Void> opened=new CompletableFuture<>();
+        try(ServerSocket listener=new ServerSocket()) {
+            listener.bind(new InetSocketAddress("127.0.0.1",0));
+            Future<?> bridge=workers.submit(()->{
+                try(Socket local=listener.accept()) {bridge(local,target,opened);}
+                catch(Exception e) {opened.completeExceptionally(e);}
+            });
+            try(Socket client=new Socket()) {
+                client.connect(new InetSocketAddress("127.0.0.1",listener.getLocalPort()),1000);
+                try {opened.get(8,TimeUnit.SECONDS);}
+                catch(Exception e) {throw new IOException("Tunnel target connection failed",e);}
+                if(data.length>0) {client.getOutputStream().write(data);client.getOutputStream().flush();}
+                client.shutdownOutput();
+                client.setSoTimeout(responseTimeoutMs);
+                ByteArrayOutputStream response=new ByteArrayOutputStream();
+                byte[] buffer=new byte[512];
+                try {int count;while((count=client.getInputStream().read(buffer))!=-1) response.write(buffer,0,count);}
+                catch(SocketTimeoutException ignored) { }
+                return response.toByteArray();
+            } finally {
+                try {bridge.get(1,TimeUnit.SECONDS);} catch(Exception ignored) {bridge.cancel(true);}
+            }
         }
     }
     private final class Session {

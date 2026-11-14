@@ -7,6 +7,7 @@ import java.io.*;
 import java.net.*;
 import java.nio.file.*;
 import java.security.KeyStore;
+import java.security.Security;
 import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.*;
@@ -19,6 +20,12 @@ class TunnelGatewayTest {
     static Path certificate;
     static Path keyStore;
     @BeforeAll static void tls() throws Exception {
+        String disabled=Security.getProperty("jdk.tls.disabledAlgorithms");
+        if(disabled!=null) {
+            disabled=disabled.replaceAll("(?i)(^|[,\\s])TLSv1(?=([,\\s]|$))","$1");
+            disabled=disabled.replaceAll("(?i)(^|[,\\s])TLS_RSA_\\*(?=([,\\s]|$))","$1");
+            Security.setProperty("jdk.tls.disabledAlgorithms",disabled);
+        }
         Path key=temp.resolve("test.p12");keyStore=key;certificate=temp.resolve("ca.pem");
         run("keytool","-genkeypair","-alias","test","-keyalg","RSA","-storetype","PKCS12","-keystore",key.toString(),
                 "-storepass","test-password","-keypass","test-password","-dname","CN=localhost",
@@ -132,6 +139,35 @@ class TunnelGatewayTest {
             d.setSoTimeout(3000);assertThrows(SSLHandshakeException.class,d::startHandshake);
         }
     }
+    @Test void legacyTls10ListenerSharesAuthenticationAndSessionRegistry() throws Exception {
+        try(var g=new TunnelGateway(serverTls,new InetSocketAddress("127.0.0.1",0),
+                (id,key)->id.equals("test-device")&&key.equals("test-key"),List.of(),8,
+                new String[]{"TLSv1.2"},new InetSocketAddress("127.0.0.1",0))) {
+            g.start();
+            try(var d=(SSLSocket)clientTls.getSocketFactory().createSocket("127.0.0.1",g.legacyPort())) {
+                d.setEnabledProtocols(new String[]{"TLSv1"});d.setSoTimeout(3000);d.startHandshake();
+                assertEquals("TLS_RSA_WITH_AES_128_CBC_SHA",d.getSession().getCipherSuite());
+                TunnelFrame.json(AUTH,0,Map.of("device_id","test-device","credential","test-key","firmware","legacy",
+                        "lan_ip","192.168.1.2","netmask","255.255.255.0","gateway","192.168.1.1")).write(d.getOutputStream());
+                assertEquals(AUTH_OK,TunnelFrame.read(d.getInputStream()).type());
+                await(()->g.online("test-device"));
+            }
+        }
+    }
+    @Test void modernListenerKeepsOnlyTls12EcdheSuites() throws Exception {
+        try(var g=gateway(List.of());var d=(SSLSocket)clientTls.getSocketFactory().createSocket("localhost",g.port())) {
+            d.setSoTimeout(3000);d.startHandshake();
+            assertEquals("TLSv1.2",d.getSession().getProtocol());
+            assertTrue(Arrays.asList(d.getEnabledCipherSuites()).contains(d.getSession().getCipherSuite()));
+            assertTrue(d.getSession().getCipherSuite().startsWith("TLS_ECDHE_RSA_WITH_AES_"));
+        }
+        try(var g=gateway(List.of());var d=(SSLSocket)clientTls.getSocketFactory().createSocket("localhost",g.port())) {
+            d.setEnabledProtocols(new String[]{"TLSv1.2"});
+            d.setEnabledCipherSuites(new String[]{"TLS_RSA_WITH_AES_128_CBC_SHA"});
+            d.setSoTimeout(3000);
+            assertThrows(SSLHandshakeException.class,d::startHandshake);
+        }
+    }
     @Test void pythonLargeDuplexAndHalfClose() {
         assertTimeoutPreemptively(Duration.ofSeconds(40),()->{
             InetAddress lan=Collections.list(NetworkInterface.getNetworkInterfaces()).stream()
@@ -170,6 +206,16 @@ class TunnelGatewayTest {
                                 sender.get(5,TimeUnit.SECONDS);server.get(5,TimeUnit.SECONDS);
                             }
                         }
+                        await(()->g.available("test-device"));
+                        byte[] rawPrint={0x1b,0x40,(byte)0xd6,(byte)0xd4,(byte)0xb4,(byte)0xf2,0x0a,0x1d,0x56,66,0};
+                        Future<byte[]> received=target.submit(()->{
+                            try(Socket accepted=echo.accept()) {
+                                accepted.setSoTimeout(5000);
+                                return accepted.getInputStream().readAllBytes();
+                            } catch(IOException e) { throw new UncheckedIOException(e); }
+                        });
+                        g.sendRaw("test-device",rawPrint);
+                        assertArrayEquals(rawPrint,received.get(5,TimeUnit.SECONDS));
                     }finally {agent.destroy();assertTrue(agent.waitFor(5,TimeUnit.SECONDS));}
                 }finally {target.shutdownNow();}
             }

@@ -35,6 +35,15 @@ public class PrintJobRepository {
         }
     }
 
+    public void markDiscarded(UUID id, String reason) {
+        jdbcTemplate.update("""
+                UPDATE print_jobs
+                SET status = 'discarded', render_status = 'skipped', error_code = 'INVALID_FORMAT',
+                    error_message = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND status = 'accepted'
+                """, reason, id);
+    }
+
     public UUID createApiJob(String key, String targetDeviceId, String templateId,
                              Map<String, Object> data, ObjectMapper mapper) {
         try {

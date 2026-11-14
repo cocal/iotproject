@@ -26,3 +26,9 @@ printer:
     key-store: ${TUNNEL_KEY_STORE:}
     key-store-password: ${TUNNEL_KEY_STORE_PASSWORD:}
     mappings: []
+    legacy-tls10-enabled: ${TUNNEL_LEGACY_TLS10_ENABLED:false}
+    legacy-bind: ${TUNNEL_LEGACY_BIND:0.0.0.0}
+    legacy-port: ${TUNNEL_LEGACY_PORT:9444}
+  console-admin:
+    api-key: ${CONSOLE_ADMIN_API_KEY:}
+    allowed-cidrs: ${CONSOLE_ADMIN_ALLOWED_CIDRS:}

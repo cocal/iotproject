@@ -36,5 +36,29 @@ class LegacyInvoiceParserTest {
 
         assertThat(parsed.get("lines")).isEqualTo(List.of("legacy line"));
         assertThat(parsed.get("items")).isEqualTo(List.of());
+        assertThat(parsed.get("validationErrors")).asList().contains("缺少单号", "缺少客户名称", "缺少地址", "合计金额格式无效", "缺少商品明细");
+    }
+
+    @Test
+    void acceptsExistingSupportedAliasesAndNumericTotals() {
+        var parsed = parser.parse(List.of(
+                "客户:测试客户", "单号:XS002", "品名 数量", "商品 1", "合计:1,280.50", "地址:测试地址"));
+
+        assertThat(parsed.get("validationErrors")).asList().isEmpty();
+    }
+
+    @Test
+    void rejectsReplacementAndControlCharacters() {
+        var parsed = parser.parse(List.of("\uFFFD malformed", "\u0001 control"));
+
+        assertThat(parsed.get("validationErrors")).asList().contains("包含非法字符");
+    }
+
+    @Test
+    void rejectsMalformedThousandsSeparators() {
+        var parsed = parser.parse(List.of(
+                "客户:测试客户", "单号:XS003", "品名 数量", "商品 1", "合计:1,,280.50", "地址:测试地址"));
+
+        assertThat(parsed.get("validationErrors")).asList().contains("合计金额格式无效");
     }
 }

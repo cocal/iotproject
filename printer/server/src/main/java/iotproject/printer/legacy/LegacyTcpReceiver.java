@@ -139,9 +139,18 @@ public class LegacyTcpReceiver {
     }
 
     private void persist(List<String> lines, String sourceIp) {
-        String rawPayload = String.join("\n", lines);
-        var parsed = parser.parse(lines);
+        String rawPayload = String.join("\n", lines).replace(String.valueOf((char) 0), "\\u0000");
+        List<String> databaseSafeLines = lines.stream().map(line -> line.replace((char) 0, '\uFFFD')).toList();
+        var parsed = parser.parse(databaseSafeLines);
         var id = jobs.createLegacyJob(rawPayload, parsed, sourceIp);
+        @SuppressWarnings("unchecked")
+        var validationErrors = (List<String>) parsed.get("validationErrors");
+        if (!validationErrors.isEmpty()) {
+            jobs.markDiscarded(id, String.join("；", validationErrors));
+            log.info("Discarded invalid legacy print job {} from {}: {}", id, sourceIp,
+                    String.join(", ", validationErrors));
+            return;
+        }
         try {
             byte[] artifact = renderer.render(parsed);
             jobs.markRendered(id, artifact, sha256(artifact));

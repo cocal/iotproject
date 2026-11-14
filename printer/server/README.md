@@ -64,7 +64,9 @@ mvn spring-boot:run -Dspring-boot.run.arguments="--spring.config.additional-loca
 
 在可访问打印机内网的 Linux 主机启动 `../device/simulator/client.py`，具体参数见其 README。当设备在线时，VPS 本机连 `127.0.0.1:19100` 会触发 OPEN 至示例 `192.168.1.50:9100`，后续字节原样双向转发。不要用真实打印机做随意文本探测；先用 echo 目标验证。
 
-离线、单流忙或连接失败时，本机入口关闭连接；当前不提供自动排队、SOCKS5、Web 扫描接口或自动打印投递。任务调度、动态 Web 目标管理和打印结果判定待接入。在线状态目前在进程内存中，未接后台设备列表；设备固件尚未实现。
+离线、单流忙或连接失败时，本机入口关闭连接；当前不提供通用 SOCKS5 或 Web 扫描接口。在线状态目前在进程内存中，未接后台设备列表。自动投递保持关闭，需由后台用户显式触发测试打印或重打。
+
+控制台管理动作通过独立 `X-Console-Key` 内部 API 转发，不复用只读数据库账号。配置 `printer.console-admin.api-key` 与扫描网段白名单 `printer.console-admin.allowed-cidrs` 后，可按指定 IPv4 网段探测常见打印端口、发送独立测试小票或重发某任务已保存的 ESC/POS 产物。只有 RAW 9100 支持本次测试打印/重打；扫描发现端口只代表 TCP 可连通，不保证识别为打印机。所有动作写入 `printer_admin_actions` 审计表。打印操作返回“已发送/结果未知”，不等于确认出纸。
 
 ### 测试
 
