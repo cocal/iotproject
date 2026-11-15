@@ -10,6 +10,10 @@ printer:
     max-connections: 64
     mappings:
       - device-id: gateway-room-1
-        local-port: 19100
+        local-port: 19101
         target-ip: 192.168.1.50
+        target-port: 9100
+      - device-id: gateway-room-2
+        local-port: 19102
+        target-ip: 192.168.2.50
         target-port: 9100

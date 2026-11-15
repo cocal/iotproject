@@ -63,6 +63,11 @@ public final class TunnelGateway implements AutoCloseable {
                          List<Mapping> mappings,int maxConnections,String[] enabledProtocols,
                          InetSocketAddress legacyAddress) {
         this.tls=tls; this.address=address; this.authenticate=authenticate; this.mappings=List.copyOf(mappings);
+        Set<Integer> configuredPorts=new HashSet<>();
+        for(Mapping mapping:this.mappings) {
+            if(mapping.localPort()!=0 && !configuredPorts.add(mapping.localPort()))
+                throw new IllegalArgumentException("Duplicate local tunnel mapping port: "+mapping.localPort());
+        }
         if(enabledProtocols==null || enabledProtocols.length!=1
                 || !(enabledProtocols[0].equals("TLSv1.2") || enabledProtocols[0].equals("TLSv1")))
             throw new IllegalArgumentException("Only isolated TLSv1.2 or legacy TLSv1 listeners are supported");
@@ -93,6 +98,8 @@ public final class TunnelGateway implements AutoCloseable {
             for(Mapping mapping:mappings) {
                 ServerSocket local=new ServerSocket(); listeners.add(local);
                 local.bind(new InetSocketAddress("127.0.0.1",mapping.localPort())); mappingPorts.add(local.getLocalPort());
+                log.info("TCP mapping listening on 127.0.0.1:{} -> device {} -> {}:{}",
+                        local.getLocalPort(),mapping.deviceId(),mapping.targetIp(),mapping.targetPort());
                 workers.execute(() -> accept(local,mapping));
             }
             timer.scheduleAtFixedRate(() -> sessions.values().forEach(Session::tick),1,1,TimeUnit.SECONDS);
@@ -229,21 +236,34 @@ public final class TunnelGateway implements AutoCloseable {
         int nextId=1;
         Session(SSLSocket socket) {this.socket=socket;}
         void run() throws Exception {
+            String stage="TLS handshake";
             try {
                 socket.setSoTimeout(10_000); socket.startHandshake();
+                stage="device authentication";
                 TunnelFrame auth=TunnelFrame.read(socket.getInputStream());
                 if(auth.type()!=AUTH) throw new IOException("AUTH required");
                 var json=auth.json(); device=text(json,"device_id",64);
                 if(!device.matches("[A-Za-z0-9_.-]+")) throw new IOException("Invalid device");
                 String secret=text(json,"credential",128); text(json,"firmware",64);
                 text(json,"lan_ip",15);text(json,"netmask",15);text(json,"gateway",15);
-                if(!authenticate.test(device,secret)) {send(TunnelFrame.json(AUTH_ERROR,0,Map.of("code","DENIED")));return;}
+                if(!authenticate.test(device,secret)) {
+                    log.warn("Tunnel device authentication rejected: device={}, remote={}",
+                            device,socket.getRemoteSocketAddress());
+                    send(TunnelFrame.json(AUTH_ERROR,0,Map.of("code","DENIED")));return;
+                }
                 send(TunnelFrame.json(AUTH_OK,0,Map.of("session_id",UUID.randomUUID().toString(),
                         "heartbeat_sec",30,"timeout_sec",90,"initial_window",WINDOW_SIZE)));
                 Session old=sessions.put(device,this); if(old!=null) old.shutdown();
                 log.info("Tunnel device online: {}",device);
+                stage="tunnel session";
                 socket.setSoTimeout(90_000);
                 while(!socket.isClosed()) receive(TunnelFrame.read(socket.getInputStream()));
+            } catch(Exception failure) {
+                if(stage.equals("TLS handshake") || stage.equals("device authentication")) {
+                    log.warn("Tunnel connection from {} failed during {}: {}",socket.getRemoteSocketAddress(),
+                            stage,failure.getClass().getSimpleName());
+                }
+                throw failure;
             } finally { shutdown(); }
         }
         void receive(TunnelFrame frame) throws Exception {
@@ -265,7 +285,10 @@ public final class TunnelGateway implements AutoCloseable {
                     }
                     case OPEN_ERROR -> {
                         if(s.opened.isDone()) throw new IOException("Late OPEN_ERROR");
-                        text(frame.json(),"code",64); stream=null;s.fail();
+                        String code=text(frame.json(),"code",64);
+                        log.warn("Tunnel target connection rejected: device={}, target={}:{}, stream={}, code={}",
+                                device,s.mapping.targetIp(),s.mapping.targetPort(),s.id,code);
+                        stream=null;s.fail();
                     }
                     case DATA -> {
                         if(!s.opened.isDone() || s.remoteFin || frame.payload().length>s.receiveCredit)
@@ -305,7 +328,7 @@ public final class TunnelGateway implements AutoCloseable {
         synchronized Stream open(Socket local,Mapping mapping) throws IOException {
             if(stream!=null || socket.isClosed()) return null;
             if(nextId==0) {shutdown();return null;}
-            Stream s=new Stream(this,nextId++,local);stream=s;
+            Stream s=new Stream(this,nextId++,local,mapping);stream=s;
             send(TunnelFrame.json(OPEN,s.id,Map.of("target_ip",mapping.targetIp(),"target_port",mapping.targetPort(),
                     "connect_timeout_ms",1500,"idle_timeout_sec",120,"initial_window",WINDOW_SIZE)));
             return s;
@@ -339,13 +362,15 @@ public final class TunnelGateway implements AutoCloseable {
         }
     }
     private final class Stream {
-        final Session session;final int id;final Socket local;
+        final Session session;final int id;final Socket local;final Mapping mapping;
         final CompletableFuture<Void> opened=new CompletableFuture<>(),done=new CompletableFuture<>();
         final BlockingQueue<TunnelFrame> incoming=new ArrayBlockingQueue<>(WINDOW_SIZE+2);
         int sendCredit,receiveCredit=WINDOW_SIZE;
         boolean localFin,remoteFin,peerClosed,reset;
         volatile long lastActivity=System.nanoTime(),resetAt;
-        Stream(Session session,int id,Socket local) {this.session=session;this.id=id;this.local=local;}
+        Stream(Session session,int id,Socket local,Mapping mapping) {
+            this.session=session;this.id=id;this.local=local;this.mapping=mapping;
+        }
         synchronized int awaitCredit() throws IOException,InterruptedException {
             while(sendCredit==0 && !reset && !done.isDone()) wait();
             if(reset || done.isDone()) throw new IOException("Stream closed");return sendCredit;

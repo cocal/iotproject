@@ -43,15 +43,21 @@ class TunnelGatewayTest {
         String output=new String(p.getInputStream().readAllBytes());assertEquals(0,p.waitFor(),output);
     }
     static TunnelGateway gateway(List<TunnelGateway.Mapping> mappings) throws Exception {
+        return gateway(mappings,Set.of("test-device"));
+    }
+    static TunnelGateway gateway(List<TunnelGateway.Mapping> mappings,Set<String> deviceIds) throws Exception {
         var g=new TunnelGateway(serverTls,new InetSocketAddress("127.0.0.1",0),
-                (id,key)->id.equals("test-device") && key.equals("test-key"),mappings,16);
+                (id,key)->deviceIds.contains(id) && key.equals("test-key"),mappings,16);
         g.start();return g;
     }
     static SSLSocket device(TunnelGateway g,String secret) throws Exception {
+        return device(g,"test-device",secret);
+    }
+    static SSLSocket device(TunnelGateway g,String deviceId,String secret) throws Exception {
         var socket=(SSLSocket)clientTls.getSocketFactory().createSocket("localhost",g.port());
         var params=socket.getSSLParameters();params.setEndpointIdentificationAlgorithm("HTTPS");socket.setSSLParameters(params);
         socket.setSoTimeout(5000);socket.startHandshake();
-        TunnelFrame.json(AUTH,0,Map.of("device_id","test-device","credential",secret,"firmware","test",
+        TunnelFrame.json(AUTH,0,Map.of("device_id",deviceId,"credential",secret,"firmware","test",
                 "lan_ip","192.168.1.2","netmask","255.255.255.0","gateway","192.168.1.1")).write(socket.getOutputStream());return socket;
     }
     static void await(Callable<Boolean> check) throws Exception {
@@ -70,6 +76,32 @@ class TunnelGatewayTest {
         assertThrows(IOException.class,()->new TunnelFrame(PING,0,"{\"nonce\":1,\"nonce\":2}".getBytes()).json());
         assertThrows(IOException.class,()->new TunnelFrame(PING,0,"{} {}".getBytes()).json());
         assertThrows(IllegalArgumentException.class,()->new TunnelGateway.Mapping("test",0,"127.0.0.1",9100));
+        assertThrows(IllegalArgumentException.class,()->new TunnelGateway(serverTls,
+                new InetSocketAddress("127.0.0.1",0),(id,key)->true,
+                List.of(new TunnelGateway.Mapping("one",19100,"192.168.1.50",9100),
+                        new TunnelGateway.Mapping("two",19100,"192.168.2.50",9100)),16));
+    }
+    @Test void mappingsRouteToTheirOwnDeviceAndTarget() throws Exception {
+        var mappings=List.of(
+                new TunnelGateway.Mapping("test-device",0,"192.168.180.94",9100),
+                new TunnelGateway.Mapping("other-device",0,"192.168.2.94",9100));
+        try(var g=gateway(mappings,Set.of("test-device","other-device"));
+            var first=device(g,"test-device","test-key");var second=device(g,"other-device","test-key")) {
+            assertEquals(AUTH_OK,TunnelFrame.read(first.getInputStream()).type());
+            assertEquals(AUTH_OK,TunnelFrame.read(second.getInputStream()).type());
+            await(()->g.online("test-device")&&g.online("other-device"));
+            for(int i=0;i<mappings.size();i++) {
+                var mapping=mappings.get(i);var device=i==0?first:second;
+                try(var local=new Socket("127.0.0.1",g.mappingPort(i))) {
+                    TunnelFrame open=TunnelFrame.read(device.getInputStream());
+                    assertEquals(OPEN,open.type());
+                    assertEquals(mapping.targetIp(),open.json().get("target_ip").textValue());
+                    assertEquals(mapping.targetPort(),open.json().get("target_port").intValue());
+                    TunnelFrame.json(OPEN_ERROR,open.streamId(),Map.of("code","REFUSED"))
+                            .write(device.getOutputStream());
+                }
+            }
+        }
     }
     @Test void springConfigurationIsOptInAndBindsMappings() {
         var runner=new org.springframework.boot.test.context.runner.ApplicationContextRunner()
