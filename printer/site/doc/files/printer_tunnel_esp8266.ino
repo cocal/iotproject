@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <ESP8266WiFi.h>
 #include <WiFiClientSecureBearSSL.h>
+#include <StackThunk.h>
 #include "ArduinoJson.h"
 #include <ESP8266WebServer.h>
 #include <LittleFS.h>
@@ -68,11 +69,52 @@ uint8_t ring[CREDIT];size_t ringHead=0,ringSize=0;
 uint8_t outbound[CREDIT];size_t outHead=0,outSize=0;
 uint8_t header[16],payload[CHUNK];size_t headerUsed=0,payloadUsed=0,payloadLength=0;
 uint8_t incomingType=0;uint32_t incomingSid=0;
+uint32_t memoryLowHeap=UINT32_MAX,memoryLowBlock=UINT32_MAX,memoryLowStack=UINT32_MAX;
+uint32_t memorySampleAt=0,lastMemoryReport=0,lastPressureReport=0;
+uint32_t pressureBytes=0,pressureRingSize=0;
+volatile bool memoryPressurePending=false;
 
 uint32_t read32(const uint8_t *p) {return uint32_t(p[0])<<24|uint32_t(p[1])<<16|uint32_t(p[2])<<8|p[3];}
 void put32(uint8_t *p,uint32_t n){p[0]=n>>24;p[1]=n>>16;p[2]=n>>8;p[3]=n;}
 bool elapsed(uint32_t since,uint32_t duration){return uint32_t(millis()-since)>=duration;}
 bool known(uint8_t t){return t==AUTH||t==AUTH_OK||t==AUTH_ERROR||t==OPEN||t==OPEN_OK||t==OPEN_ERROR||t==DATA||t==WINDOW||t==FIN||t==STREAM_CLOSED||t==RESET||t==PING||t==PONG;}
+
+void sampleMemory(){
+    if(memorySampleAt&& !elapsed(memorySampleAt,5000))return;
+    memorySampleAt=millis();
+    uint32_t freeHeap=ESP.getFreeHeap();
+    if(freeHeap<memoryLowHeap)memoryLowHeap=freeHeap;
+    uint32_t freeStack=ESP.getFreeContStack();
+    if(freeStack<memoryLowStack)memoryLowStack=freeStack;
+#if defined(UMM_INFO)
+    uint32_t maxBlock=ESP.getMaxFreeBlockSize();
+    if(maxBlock<memoryLowBlock)memoryLowBlock=maxBlock;
+#endif
+}
+void memorySnapshot(const char *event){
+    uint32_t freeHeap=ESP.getFreeHeap();
+    if(freeHeap<memoryLowHeap)memoryLowHeap=freeHeap;
+    uint32_t freeStack=ESP.getFreeContStack();
+    if(freeStack<memoryLowStack)memoryLowStack=freeStack;
+    int wifiStatus=WiFi.status(),wifiRssi=WiFi.RSSI();
+    sampleMemory();
+#if defined(UMM_INFO)
+    uint32_t maxBlock=ESP.getMaxFreeBlockSize();
+    uint8_t fragmentation=ESP.getHeapFragmentation();
+    if(maxBlock<memoryLowBlock)memoryLowBlock=maxBlock;
+    Serial.printf("[mem] ms=%lu event=%s heap=%lu max=%lu frag=%u%% low_heap=%lu low_max=%lu stack=%lu low_stack=%lu tls_stack=%lu wifi=%d rssi=%d sid=%lu type=%u len=%u ring=%u out=%u\n",
+        (unsigned long)millis(),event,(unsigned long)freeHeap,(unsigned long)maxBlock,fragmentation,
+        (unsigned long)memoryLowHeap,(unsigned long)memoryLowBlock,(unsigned long)freeStack,
+        (unsigned long)memoryLowStack,(unsigned long)stack_thunk_get_max_usage(),wifiStatus,wifiRssi,
+        (unsigned long)sid,incomingType,(unsigned)payloadLength,(unsigned)ringSize,(unsigned)outSize);
+#else
+    Serial.printf("[mem] ms=%lu event=%s heap=%lu low_heap=%lu stack=%lu low_stack=%lu tls_stack=%lu wifi=%d rssi=%d sid=%lu type=%u len=%u ring=%u out=%u\n",
+        (unsigned long)millis(),event,(unsigned long)freeHeap,(unsigned long)memoryLowHeap,
+        (unsigned long)freeStack,(unsigned long)memoryLowStack,
+        (unsigned long)stack_thunk_get_max_usage(),wifiStatus,wifiRssi,(unsigned long)sid,
+        incomingType,(unsigned)payloadLength,(unsigned)ringSize,(unsigned)outSize);
+#endif
+}
 
 bool sendFrame(uint8_t type,uint32_t stream,const uint8_t *bytes=nullptr,size_t length=0){
     // One loop owns TLS. BearSSL handles partial TCP/TLS writes internally.
@@ -101,7 +143,8 @@ void clearTarget(){
     sid=0;opened=connecting=notified=false;remoteFin=localFin=writeClosed=false;
     targetError=targetEof=false;ringHead=ringSize=outHead=outSize=0;unacked=returnedCredit=0;toTargetCredit=CREDIT;closeAt=0;
 }
-void disconnectTunnel(){
+void disconnectTunnel(const char *reason="unspecified"){
+    memorySnapshot(reason);
     clearTarget();tunnel.stop();online=false;headerUsed=payloadUsed=0;protocolBad=false;
     lastSid=0;pingCount=0;
     nextAttempt=millis()+backoff+random(0,251);backoff=min(backoff*2,uint32_t(30000));
@@ -116,7 +159,12 @@ void resetFlow(const char *code){
 err_t targetReceive(void *,tcp_pcb *,pbuf *p,err_t error){
     if(error!=ERR_OK){targetError=true;return error;}
     if(!p){targetEof=true;return ERR_OK;}
-    if(p->tot_len>CREDIT-ringSize)return ERR_MEM; // lwIP retains pbuf and retries
+    if(p->tot_len>CREDIT-ringSize){
+        if(!lastPressureReport||elapsed(lastPressureReport,5000)){
+            lastPressureReport=millis();pressureBytes=p->tot_len;pressureRingSize=ringSize;memoryPressurePending=true;
+        }
+        return ERR_MEM; // lwIP retains pbuf and retries
+    }
     size_t tail=(ringHead+ringSize)%CREDIT;
     for(pbuf *q=p;q;q=q->next){
         const uint8_t *data=static_cast<const uint8_t*>(q->payload);
@@ -144,10 +192,41 @@ bool allowed(IPAddress ip,uint16_t port){
 }
 bool integer(JsonVariantConst v,uint32_t low,uint32_t high){return v.is<uint32_t>()&&v.as<uint32_t>()>=low&&v.as<uint32_t>()<=high;}
 
+bool parseWindowCredit(uint32_t &creditValue){
+    size_t offset=0;
+    while(offset<payloadLength&&(payload[offset]==' '||payload[offset]=='\t'||payload[offset]=='\r'||payload[offset]=='\n'))offset++;
+    if(offset>=payloadLength||payload[offset++]!='{')return false;
+    while(offset<payloadLength&&(payload[offset]==' '||payload[offset]=='\t'||payload[offset]=='\r'||payload[offset]=='\n'))offset++;
+    const char key[]="\"credit\"";
+    for(size_t i=0;i<sizeof(key)-1;i++)if(offset>=payloadLength||payload[offset++]!=key[i])return false;
+    while(offset<payloadLength&&(payload[offset]==' '||payload[offset]=='\t'||payload[offset]=='\r'||payload[offset]=='\n'))offset++;
+    if(offset>=payloadLength||payload[offset++]!=':')return false;
+    while(offset<payloadLength&&(payload[offset]==' '||payload[offset]=='\t'||payload[offset]=='\r'||payload[offset]=='\n'))offset++;
+    if(offset>=payloadLength||payload[offset]<'0'||payload[offset]>'9')return false;
+    if(payload[offset]=='0'&&offset+1<payloadLength&&payload[offset+1]>='0'&&payload[offset+1]<='9')return false;
+    uint32_t parsed=0;
+    do{
+        uint32_t digit=payload[offset++]-'0';
+        if(parsed>(CREDIT-digit)/10)return false;
+        parsed=parsed*10+digit;
+    }while(offset<payloadLength&&payload[offset]>='0'&&payload[offset]<='9');
+    if(parsed==0)return false;
+    while(offset<payloadLength&&(payload[offset]==' '||payload[offset]=='\t'||payload[offset]=='\r'||payload[offset]=='\n'))offset++;
+    if(offset>=payloadLength||payload[offset++]!='}')return false;
+    while(offset<payloadLength&&(payload[offset]==' '||payload[offset]=='\t'||payload[offset]=='\r'||payload[offset]=='\n'))offset++;
+    if(offset!=payloadLength)return false;
+    creditValue=parsed;return true;
+}
+
 void dispatch(){
     StaticJsonDocument<1536> doc;
-    if(incomingType!=DATA && incomingType!=FIN && incomingType!=STREAM_CLOSED){
-        if(deserializeJson(doc,payload,payloadLength)||!doc.is<JsonObject>()){protocolBad=true;return;}
+    if(incomingType!=DATA && incomingType!=WINDOW && incomingType!=FIN && incomingType!=STREAM_CLOSED){
+        DeserializationError parseError=deserializeJson(doc,payload,payloadLength);
+        if(parseError||!doc.is<JsonObject>()){
+            Serial.printf("[protocol] json_invalid type=%u len=%u error=%s\n",incomingType,(unsigned)payloadLength,
+                parseError?parseError.c_str():"not_object");
+            memorySnapshot("json_invalid");protocolBad=true;return;
+        }
     }
     if(!online){
         if(incomingType!=AUTH_OK||!integer(doc["heartbeat_sec"],30,30)||!integer(doc["timeout_sec"],90,90)
@@ -155,7 +234,7 @@ void dispatch(){
             protocolBad=true;return;
         }
         online=true;onlineAt=lastPong=millis();lastPing=millis()-30000;
-        Serial.printf("Tunnel online; free heap=%u\n",ESP.getFreeHeap());return;
+        memorySnapshot("tunnel_online");return;
     }
     if(incomingType==PONG){
         if(!integer(doc["nonce"],0,UINT32_MAX)){protocolBad=true;return;}
@@ -203,8 +282,12 @@ void dispatch(){
         outSize+=payloadLength;toTargetCredit-=payloadLength;activity=millis();break;
     }
     case WINDOW:{
-        if(!integer(doc["credit"],1,CREDIT)||credit+doc["credit"].as<uint32_t>()>CREDIT){protocolBad=true;return;}
-        credit+=doc["credit"].as<uint32_t>();break;
+        uint32_t returnedCreditValue;
+        if(!parseWindowCredit(returnedCreditValue)||credit+returnedCreditValue>CREDIT){
+            Serial.printf("[protocol] window_invalid len=%u credit=%u\n",(unsigned)payloadLength,(unsigned)credit);
+            memorySnapshot("window_invalid");protocolBad=true;return;
+        }
+        credit+=returnedCreditValue;break;
     }
     case FIN:
         if(remoteFin){protocolBad=true;return;}remoteFin=true;if(!closeAt)closeAt=millis();break;
@@ -276,6 +359,7 @@ void serviceTarget(){
 }
 void connectTunnel(){
     Serial.println(F("Connecting TLS tunnel"));
+    memorySnapshot("tls_connect_start");
     tunnel.setTrustAnchors(&trust);tunnel.setSSLVersion(BR_TLS12,BR_TLS12);
     // Keep the default receive buffer: a 1 KiB app frame does NOT cap TLS records.
     tunnel.setTimeout(5000);
@@ -284,11 +368,12 @@ void connectTunnel(){
     // this server's exact self-signed cert as trust anchor (not a broad CA).
     bool connected=address.fromString(TUNNEL_HOST)
         ? tunnel.connect(address,TUNNEL_PORT) : tunnel.connect(TUNNEL_HOST,TUNNEL_PORT);
-    if(!connected){Serial.printf("TLS failure code=%d\n",tunnel.getLastSSLError());disconnectTunnel();return;}
+    if(!connected){Serial.printf("TLS failure code=%d\n",tunnel.getLastSSLError());disconnectTunnel("tls_failure");return;}
+    memorySnapshot("tls_connected");
     StaticJsonDocument<768> doc;
     doc["device_id"]=DEVICE_ID;doc["credential"]=DEVICE_KEY;doc["firmware"]="esp8266-tunnel-v1";
     doc["lan_ip"]=WiFi.localIP().toString();doc["netmask"]=WiFi.subnetMask().toString();doc["gateway"]=WiFi.gatewayIP().toString();
-    if(!sendJson(AUTH,0,doc)){disconnectTunnel();return;}connectAt=millis();
+    if(!sendJson(AUTH,0,doc)){disconnectTunnel("auth_send_failure");return;}connectAt=millis();
 }
 void startSetup(){
     setupMode=true;WiFi.mode(WIFI_AP_STA);
@@ -329,7 +414,7 @@ void startSetup(){
     Serial.printf("Setup AP: %s; open http://192.168.4.1; hold FLASH 5 seconds to reconfigure\n",name.c_str());
 }
 void setup(){
-    Serial.begin(115200);pinMode(0,INPUT_PULLUP);
+    Serial.begin(115200);pinMode(0,INPUT_PULLUP);ESP.resetFreeContStack();memorySnapshot("boot");
     WiFi.persistent(false);WiFi.mode(WIFI_STA);WiFi.setAutoReconnect(true);
     if(!LittleFS.begin()){startSetup();return;}
     File saved=LittleFS.open("/wifi.json","r");
@@ -350,29 +435,36 @@ void setup(){
 }
 
 void loop(){
+    sampleMemory();
+    if(memoryPressurePending){
+        memoryPressurePending=false;
+        Serial.printf("[buffer] rx_backpressure incoming=%u ring=%u\n",(unsigned)pressureBytes,(unsigned)pressureRingSize);
+        memorySnapshot("rx_backpressure");
+    }
     static uint32_t pressedAt=0;
     if(digitalRead(0)==LOW){
         if(!pressedAt)pressedAt=millis();
-        if(!setupMode&&elapsed(pressedAt,5000)){disconnectTunnel();startSetup();}
+        if(!setupMode&&elapsed(pressedAt,5000)){disconnectTunnel("setup_button");startSetup();}
     }else pressedAt=0;
     if(setupMode){setupWeb.handleClient();delay(1);return;}
-    if(WiFi.status()!=WL_CONNECTED){if(tunnel.connected()||sid)disconnectTunnel();delay(10);return;}
+    if(WiFi.status()!=WL_CONNECTED){if(tunnel.connected()||sid)disconnectTunnel("wifi_disconnected");delay(10);return;}
     if(time(nullptr)<1700000000){delay(10);return;}
     if(!tunnel.connected()){
-        if(online||sid)disconnectTunnel();
+        if(online||sid)disconnectTunnel("tunnel_socket_closed");
         if(int32_t(millis()-nextAttempt)>=0){connectTunnel();}
         delay(1);return;
     }
     readTunnel();serviceTarget();
     if(online){
+        if(elapsed(lastMemoryReport,60000)){lastMemoryReport=millis();memorySnapshot("periodic");}
         if(elapsed(onlineAt,60000))backoff=1000;
-        if(elapsed(lastPong,90000)){disconnectTunnel();return;}
+        if(elapsed(lastPong,90000)){disconnectTunnel("pong_timeout");return;}
         if(elapsed(lastPing,30000)){
-            if(pingCount>=4){disconnectTunnel();return;}
+            if(pingCount>=4){disconnectTunnel("ping_queue_full");return;}
             StaticJsonDocument<96> doc;doc["nonce"]=++nonce;
             pingNonces[pingCount++]=nonce;lastPing=millis();if(!sendJson(PING,0,doc))protocolBad=true;
         }
     }else if(elapsed(connectAt,10000))protocolBad=true;
-    if(protocolBad){disconnectTunnel();}
+    if(protocolBad){disconnectTunnel("protocol_error");}
     delay(1);
 }
