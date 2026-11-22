@@ -2,9 +2,13 @@ package iotproject.printer.system;
 
 import iotproject.printer.jobs.PrintJobRepository;
 import iotproject.printer.render.EscPosReceiptRenderer;
+import iotproject.printer.render.LegacyEscPosRenderer;
+import iotproject.printer.render.NativeEscPosRenderer;
 import iotproject.printer.tunnel.TunnelGateway;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.ResponseEntity;
+import org.springframework.http.MediaType;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.web.bind.annotation.*;
@@ -17,16 +21,22 @@ import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 @RestController
 @ConditionalOnProperty(name="printer.tunnel.enabled",havingValue="true")
 @RequestMapping("/internal/console")
 public class ConsoleAdminController {
+    private static final Logger log=LoggerFactory.getLogger(ConsoleAdminController.class);
     private static final List<Integer> PRINTER_PORTS = List.of(9100, 631, 515);
     private final TunnelGateway tunnel;
     private final PrintJobRepository jobs;
     private final EscPosReceiptRenderer renderer;
+    private final LegacyEscPosRenderer legacyRenderer = new LegacyEscPosRenderer();
+    private final NativeEscPosRenderer nativeRenderer = new NativeEscPosRenderer();
     private final JdbcTemplate jdbc;
+    private final ObjectMapper objectMapper;
     private final String apiKey;
     private final List<String> allowedCidrs;
     private final AtomicBoolean scanActive=new AtomicBoolean();
@@ -34,10 +44,10 @@ public class ConsoleAdminController {
     private final ConcurrentMap<UUID,ScanState> scans=new ConcurrentHashMap<>();
 
     public ConsoleAdminController(TunnelGateway tunnel, PrintJobRepository jobs, EscPosReceiptRenderer renderer,
-                                  JdbcTemplate jdbc,
+                                  JdbcTemplate jdbc, ObjectMapper objectMapper,
                                   @Value("${printer.console-admin.api-key:}") String apiKey,
                                   @Value("${printer.console-admin.allowed-cidrs:}") String cidrs) {
-        this.tunnel=tunnel;this.jobs=jobs;this.renderer=renderer;this.jdbc=jdbc;this.apiKey=apiKey;
+        this.tunnel=tunnel;this.jobs=jobs;this.renderer=renderer;this.jdbc=jdbc;this.objectMapper=objectMapper;this.apiKey=apiKey;
         this.allowedCidrs=Arrays.stream(cidrs.split(",")).map(String::trim).filter(s->!s.isEmpty()).toList();
     }
 
@@ -64,6 +74,15 @@ public class ConsoleAdminController {
     public ResponseEntity<?> scanStatus(@RequestHeader("X-Console-Key") String key,@PathVariable UUID id){
         if(!authorized(key))return ResponseEntity.status(401).build();ScanState state=scans.get(id);
         return state==null?ResponseEntity.notFound().build():ResponseEntity.ok(scanJson(state));
+    }
+
+    @GetMapping("/devices/status")
+    public ResponseEntity<?> deviceStatus(@RequestHeader("X-Console-Key") String key){
+        if(!authorized(key))return ResponseEntity.status(401).build();
+        List<Map<String,Object>> devices=List.of("qingliu-esp8266","sh-pudong").stream()
+                .map(id->Map.<String,Object>of("deviceId",id,"online",tunnel.online(id),"available",tunnel.available(id)))
+                .toList();
+        return ResponseEntity.ok(Map.of("devices",devices,"checkedAt",Instant.now().toString()));
     }
 
     private void runScan(ScanState state,long first,long last){
@@ -93,30 +112,173 @@ public class ConsoleAdminController {
 
     @PostMapping("/test-print")
     public ResponseEntity<?> testPrint(@RequestHeader("X-Console-Key") String key,@RequestBody PrintTarget request) {
+        long callStarted=System.nanoTime();
         if(!authorized(key)) return ResponseEntity.status(401).build();
         if(!validTarget(request.ip(),request.port())) return ResponseEntity.badRequest().body(Map.of("error","target_not_allowed"));
+        long renderStarted=System.nanoTime();
         try {
             byte[] data=renderer.render(Map.of("customer","打印链路测试","time",Instant.now().toString(),
                     "invoiceNo","TEST-"+UUID.randomUUID().toString().substring(0,8),"items",List.of("测试打印 1 件 0.00"),
                     "total","0.00","note","测试单据，不是业务订单"));
+            long renderMs=elapsedMs(renderStarted);
+            long sendStarted=System.nanoTime();
             tunnel.sendRaw(request.deviceId(),request.ip(),request.port(),data);
             audit(request.operator(),"test_print",request.ip(),request.port(),"sent_unknown");
+            log.info("Printer API endpoint=test_print payloadBytes={} renderMs={} sendMs={} totalMs={} outcome=sent_unknown",
+                    data.length,renderMs,elapsedMs(sendStarted),elapsedMs(callStarted));
             return ResponseEntity.ok(Map.of("result","sent_unknown","bytes",data.length));
-        } catch(Exception e) {audit(request.operator(),"test_print",request.ip(),request.port(),"delivery_unknown");return ResponseEntity.status(502).body(Map.of("error","delivery_unknown"));}
+        } catch(Exception e) {
+            audit(request.operator(),"test_print",request.ip(),request.port(),"delivery_unknown");
+            log.info("Printer API endpoint=test_print totalMs={} outcome=failed error={}",elapsedMs(callStarted),e.getClass().getSimpleName());
+            return ResponseEntity.status(502).body(Map.of("error","delivery_unknown"));
+        }
+    }
+
+    @PostMapping("/printer-status")
+    public ResponseEntity<?> printerStatus(@RequestHeader("X-Console-Key") String key,@RequestBody PrintTarget request) {
+        long callStarted=System.nanoTime();
+        if(!authorized(key)) return ResponseEntity.status(401).build();
+        if(!validTarget(request.deviceId(),request.ip(),request.port()))
+            return ResponseEntity.badRequest().body(Map.of("error","target_not_allowed"));
+        byte[] queries={0x10,0x04,0x01,0x10,0x04,0x02,0x10,0x04,0x03,0x10,0x04,0x04};
+        try {
+            byte[] response=tunnel.exchangeRaw(request.deviceId(),request.ip(),request.port(),queries,1500);
+            List<String> bytes=new ArrayList<>(response.length);
+            for(byte value:response) bytes.add(String.format("%02X",value&0xff));
+            audit(request.operator(),"printer_status",request.ip(),request.port(),"bytes="+String.join(" ",bytes));
+            log.info("Printer API endpoint=printer_status responseBytes={} totalMs={} outcome={}",response.length,
+                    elapsedMs(callStarted),response.length==0?"no_response":"response_received");
+            return ResponseEntity.ok(Map.of("result",response.length==0?"no_response":"response_received",
+                    "bytes",bytes,"bytesReceived",response.length));
+        } catch(Exception e) {
+            audit(request.operator(),"printer_status",request.ip(),request.port(),"query_failed");
+            log.info("Printer API endpoint=printer_status totalMs={} outcome=failed error={}",elapsedMs(callStarted),e.getClass().getSimpleName());
+            return ResponseEntity.status(502).body(Map.of("error","status_query_failed"));
+        }
     }
 
     @PostMapping("/reprint")
     public ResponseEntity<?> reprint(@RequestHeader("X-Console-Key") String key,@RequestBody Reprint request) {
+        long callStarted=System.nanoTime();
         if(!authorized(key)) return ResponseEntity.status(401).build();
         if(!validTarget(request.deviceId(),request.ip(),request.port())) return ResponseEntity.badRequest().body(Map.of("error","target_not_allowed"));
-        var artifact=jobs.findArtifact(request.jobId());
-        if(artifact.isEmpty()) return ResponseEntity.notFound().build();
+        if(request.jobId()==null) return ResponseEntity.badRequest().body(Map.of("error","invalid_job"));
+        byte[] output;
+        long renderMs=0;
+        String mode=request.mode()==null?"artifact":request.mode();
+        long renderStarted=System.nanoTime();
         try {
-            tunnel.sendRaw(request.deviceId(),request.ip(),request.port(),artifact.get());
-            audit(request.operator(),"reprint",request.ip(),request.port(),request.jobId()+":sent_unknown");
-            return ResponseEntity.ok(Map.of("result","sent_unknown","bytes",artifact.get().length));
-        } catch(Exception e) {audit(request.operator(),"reprint",request.ip(),request.port(),request.jobId()+":delivery_unknown");return ResponseEntity.status(502).body(Map.of("error","delivery_unknown"));}
+            if("original".equals(mode)) {
+                String raw=jdbc.query("SELECT raw_payload FROM print_jobs WHERE id = ?",
+                        rs -> rs.next()?rs.getString(1):null,request.jobId());
+                if(raw==null)return ResponseEntity.notFound().build();
+                if(raw.isBlank())return ResponseEntity.badRequest().body(Map.of("error","source_text_empty"));
+                output=legacyRenderer.renderOriginal(raw);
+            } else if("native".equals(mode)) {
+                String raw=jdbc.query("SELECT raw_payload FROM print_jobs WHERE id = ?",
+                        rs -> rs.next()?rs.getString(1):null,request.jobId());
+                if(raw==null)return ResponseEntity.notFound().build();
+                output=nativeRenderer.render(raw,request.nativeSettings());
+            } else if("image".equals(mode)) {
+                String raw=jdbc.query("SELECT raw_payload FROM print_jobs WHERE id = ?",
+                        rs -> rs.next()?rs.getString(1):null,request.jobId());
+                if(raw==null)return ResponseEntity.notFound().build();
+                output=legacyRenderer.renderReceipt(raw,request.layout());
+            } else if("artifact".equals(mode)) {
+                var artifact=jobs.findArtifact(request.jobId());
+                if(artifact.isEmpty())return ResponseEntity.notFound().build();
+                output=artifact.get();
+            } else return ResponseEntity.badRequest().body(Map.of("error","invalid_reprint_mode"));
+            renderMs=elapsedMs(renderStarted);
+        } catch(IllegalArgumentException e) {
+            log.info("Printer API endpoint=reprint mode={} outcome=render_rejected renderMs={} totalMs={}",mode,elapsedMs(renderStarted),elapsedMs(callStarted));
+            return ResponseEntity.badRequest().body(Map.of("error",e.getMessage()==null?"invalid_image":e.getMessage()));
+        } catch(java.io.IOException e) {
+            log.info("Printer API endpoint=reprint mode={} outcome=render_failed renderMs={} totalMs={}",mode,elapsedMs(renderStarted),elapsedMs(callStarted));
+            return ResponseEntity.badRequest().body(Map.of("error","invalid_image"));
+        }
+        long sendStarted=System.nanoTime();
+        try {
+            tunnel.sendRaw(request.deviceId(),request.ip(),request.port(),output);
+            audit(request.operator(),"reprint",request.ip(),request.port(),request.jobId()+":"+mode+":sent_unknown");
+            log.info("Printer API endpoint=reprint mode={} jobId={} payloadBytes={} renderMs={} sendMs={} totalMs={} outcome=sent_unknown",
+                    mode,request.jobId(),output.length,renderMs,elapsedMs(sendStarted),elapsedMs(callStarted));
+            return ResponseEntity.ok(Map.of("result","sent_unknown","mode",mode,"bytes",output.length));
+        } catch(Exception e) {
+            audit(request.operator(),"reprint",request.ip(),request.port(),request.jobId()+":"+mode+":delivery_unknown");
+            log.info("Printer API endpoint=reprint mode={} jobId={} payloadBytes={} renderMs={} sendMs={} totalMs={} outcome=delivery_unknown",
+                    mode,request.jobId(),output.length,renderMs,elapsedMs(sendStarted),elapsedMs(callStarted));
+            return ResponseEntity.status(502).body(Map.of("error","delivery_unknown"));
+        }
     }
+
+    @GetMapping(value="/reprint/preview",produces=MediaType.IMAGE_PNG_VALUE)
+    public ResponseEntity<?> reprintPreview(@RequestHeader("X-Console-Key") String key,@RequestParam UUID jobId,
+                                            @RequestParam(required=false) String layout,
+                                            @RequestParam(required=false) String nativeLayout,
+                                            @RequestParam(required=false, defaultValue="image") String format) {
+        long callStarted=System.nanoTime();
+        if(!authorized(key)) return ResponseEntity.status(401).build();
+        try {
+            String raw=jdbc.query("SELECT raw_payload FROM print_jobs WHERE id = ?",
+                    rs -> rs.next()?rs.getString(1):null,jobId);
+            if(raw==null)return ResponseEntity.notFound().build();
+            long renderStarted=System.nanoTime();
+            LegacyEscPosRenderer.LayoutSettings settings = layout == null || layout.isBlank()
+                    ? LegacyEscPosRenderer.LayoutSettings.defaults()
+                    : objectMapper.readValue(layout, LegacyEscPosRenderer.LayoutSettings.class).validated();
+            NativeEscPosRenderer.Settings nativeSettings = nativeLayout == null || nativeLayout.isBlank()
+                    ? NativeEscPosRenderer.Settings.defaults()
+                    : objectMapper.readValue(nativeLayout, NativeEscPosRenderer.Settings.class).validated();
+            byte[] png="native".equals(format)?nativeRenderer.preview(raw,nativeSettings):legacyRenderer.renderReceiptPreview(raw,settings);
+            log.info("Printer API endpoint=reprint_preview jobId={} sourceChars={} pngBytes={} renderMs={} totalMs={} outcome=ok",
+                    jobId,raw.length(),png.length,elapsedMs(renderStarted),elapsedMs(callStarted));
+            return ResponseEntity.ok().contentType(MediaType.IMAGE_PNG).body(png);
+        } catch(IllegalArgumentException e) {
+            log.info("Printer API endpoint=reprint_preview jobId={} outcome=render_rejected totalMs={}",jobId,elapsedMs(callStarted));
+            return ResponseEntity.badRequest().build();
+        } catch(com.fasterxml.jackson.core.JsonProcessingException e) {
+            log.info("Printer API endpoint=reprint_preview jobId={} outcome=invalid_layout totalMs={}",jobId,elapsedMs(callStarted));
+            return ResponseEntity.badRequest().build();
+        } catch(Exception e) {
+            log.warn("Printer API endpoint=reprint_preview jobId={} outcome=failed totalMs={} error={}",jobId,elapsedMs(callStarted),e.getClass().getSimpleName());
+            return ResponseEntity.internalServerError().build();
+        }
+    }
+
+    @GetMapping(value="/reprint/preview/sample",produces=MediaType.IMAGE_PNG_VALUE)
+    public ResponseEntity<?> sampleReprintPreview(@RequestHeader("X-Console-Key") String key,
+                                                   @RequestParam(required=false) String layout,
+                                                   @RequestParam(required=false) String nativeLayout,
+                                                   @RequestParam(required=false, defaultValue="image") String format) {
+        long callStarted=System.nanoTime();
+        if(!authorized(key)) return ResponseEntity.status(401).build();
+        String sample="清流镇同利五金电器销售部\n销售单\n单号：PREVIEW-001\n客户：排版预览\n品名 数量 单价 金额\n示例商品 2 12.50 25.00\n合计金额：25.00\n此为排版预览，不会打印";
+        try {
+            LegacyEscPosRenderer.LayoutSettings settings = layout == null || layout.isBlank()
+                    ? LegacyEscPosRenderer.LayoutSettings.defaults()
+                    : objectMapper.readValue(layout, LegacyEscPosRenderer.LayoutSettings.class).validated();
+            long renderStarted=System.nanoTime();
+            NativeEscPosRenderer.Settings nativeSettings = nativeLayout == null || nativeLayout.isBlank()
+                    ? NativeEscPosRenderer.Settings.defaults()
+                    : objectMapper.readValue(nativeLayout, NativeEscPosRenderer.Settings.class).validated();
+            byte[] png="native".equals(format)?nativeRenderer.preview(sample,nativeSettings):legacyRenderer.renderReceiptPreview(sample,settings);
+            log.info("Printer API endpoint=reprint_preview_sample sourceChars={} pngBytes={} renderMs={} totalMs={} outcome=ok",
+                    sample.length(),png.length,elapsedMs(renderStarted),elapsedMs(callStarted));
+            return ResponseEntity.ok().contentType(MediaType.IMAGE_PNG).body(png);
+        } catch(IllegalArgumentException e) {
+            log.info("Printer API endpoint=reprint_preview_sample outcome=render_rejected totalMs={}",elapsedMs(callStarted));
+            return ResponseEntity.badRequest().build();
+        } catch(com.fasterxml.jackson.core.JsonProcessingException e) {
+            log.info("Printer API endpoint=reprint_preview_sample outcome=invalid_layout totalMs={}",elapsedMs(callStarted));
+            return ResponseEntity.badRequest().build();
+        } catch(Exception e) {
+            log.warn("Printer API endpoint=reprint_preview_sample outcome=failed totalMs={} error={}",elapsedMs(callStarted),e.getClass().getSimpleName());
+            return ResponseEntity.internalServerError().build();
+        }
+    }
+
+    private long elapsedMs(long startedNanos) { return TimeUnit.NANOSECONDS.toMillis(System.nanoTime()-startedNanos); }
 
     private boolean validTarget(String device,String ip,int port) {return allowedIp(ip)&&port==9100&&tunnel.online(device);}
     private boolean validTarget(String ip,int port) {return allowedIp(ip)&&port==9100;}
@@ -141,5 +303,6 @@ public class ConsoleAdminController {
     private void audit(String operator,String action,String ip,Integer port,String result){jdbc.update("INSERT INTO printer_admin_actions(operator,action,target_ip,target_port,result) VALUES (?,?,?::inet,?,?)",operator,action,ip,port,result);}
     public record Scan(String deviceId,String cidr,String operator){}
     public record PrintTarget(String deviceId,String ip,int port,String operator){}
-    public record Reprint(String deviceId,String ip,int port,UUID jobId,String operator){}
+    public record Reprint(String deviceId,String ip,int port,UUID jobId,String operator,String mode,
+                          LegacyEscPosRenderer.LayoutSettings layout,NativeEscPosRenderer.Settings nativeSettings){}
 }

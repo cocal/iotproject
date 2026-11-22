@@ -7,6 +7,9 @@ RUN mvn -q -DskipTests package
 
 FROM eclipse-temurin:17-jre
 WORKDIR /app
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends fonts-noto-cjk \
+    && rm -rf /var/lib/apt/lists/*
 COPY --from=build /app/target/printer-server-0.1.0-SNAPSHOT.jar app.jar
 EXPOSE 8080 9100
 ENTRYPOINT ["java", "-jar", "app.jar"]

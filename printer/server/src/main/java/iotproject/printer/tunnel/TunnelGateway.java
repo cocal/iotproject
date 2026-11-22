@@ -199,6 +199,11 @@ public final class TunnelGateway implements AutoCloseable {
     public void sendRaw(String device,String targetIp,int targetPort,byte[] data) throws IOException {
         exchange(device,targetIp,targetPort,data,750);
     }
+    public byte[] exchangeRaw(String device,String targetIp,int targetPort,byte[] data,int responseTimeoutMs) throws IOException {
+        if(data==null || data.length==0 || data.length>64 || responseTimeoutMs<100 || responseTimeoutMs>5000)
+            throw new IllegalArgumentException("Invalid raw exchange bounds");
+        return exchange(device,targetIp,targetPort,data,responseTimeoutMs);
+    }
     private byte[] exchange(String device,String targetIp,int targetPort,byte[] data,int responseTimeoutMs) throws IOException {
         Mapping target=new Mapping(device,0,targetIp,targetPort);
         if(!available(device)) throw new IOException("Device offline or tunnel busy");

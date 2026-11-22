@@ -66,7 +66,7 @@ mvn spring-boot:run -Dspring-boot.run.arguments="--spring.config.additional-loca
 
 离线、单流忙或连接失败时，本机入口关闭连接；当前不提供通用 SOCKS5 或 Web 扫描接口。在线状态目前在进程内存中，未接后台设备列表。自动投递保持关闭，需由后台用户显式触发测试打印或重打。
 
-控制台管理动作通过独立 `X-Console-Key` 内部 API 转发，不复用只读数据库账号。配置 `printer.console-admin.api-key` 与扫描网段白名单 `printer.console-admin.allowed-cidrs` 后，可按指定 IPv4 网段探测常见打印端口、发送独立测试小票或重发某任务已保存的 ESC/POS 产物。只有 RAW 9100 支持本次测试打印/重打；扫描发现端口只代表 TCP 可连通，不保证识别为打印机。所有动作写入 `printer_admin_actions` 审计表。打印操作返回“已发送/结果未知”，不等于确认出纸。
+控制台管理动作通过独立 `X-Console-Key` 内部 API 转发，不复用只读数据库账号。配置 `printer.console-admin.api-key` 与扫描网段白名单 `printer.console-admin.allowed-cidrs` 后，可按指定 IPv4 网段探测常见打印端口、发送独立测试小票或重打某任务。重打图片模式从数据库读取原文，在 Java 服务端按参考小票排版渲染；预览与打印共用相同绘图逻辑，浏览器请求不上传图片。排版使用 26pt 店名、30pt 居中标题、16pt 正文、26pt 左对齐合计/实收金额。输出使用通用 ESC/POS 1-bit raster，省略空白行并直接编码位图，避免 PNG 中转。打印、重打及预览日志包含渲染耗时、发送耗时、总耗时和数据量。运行图片模式需要安装 `Noto Sans CJK SC`；原文超过 200,000 字符时拒绝图片渲染。只有 RAW 9100 支持测试打印/重打；扫描发现端口只代表 TCP 可连通，不保证识别为打印机。所有动作写入 `printer_admin_actions` 审计表。打印操作返回“已发送/结果未知”，不等于确认出纸。
 
 ### 测试
 

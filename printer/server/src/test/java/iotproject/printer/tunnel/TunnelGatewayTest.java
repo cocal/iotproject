@@ -248,6 +248,20 @@ class TunnelGatewayTest {
                         });
                         g.sendRaw("test-device",rawPrint);
                         assertArrayEquals(rawPrint,received.get(5,TimeUnit.SECONDS));
+                        await(()->g.available("test-device"));
+                        byte[] statusQueries={0x10,0x04,0x01,0x10,0x04,0x02,0x10,0x04,0x03,0x10,0x04,0x04};
+                        byte[] statusResponse={0x16,0x12,0x04,0x00};
+                        Future<byte[]> query=target.submit(()->{
+                            try(Socket accepted=echo.accept()) {
+                                accepted.setSoTimeout(5000);
+                                assertArrayEquals(statusQueries,accepted.getInputStream().readAllBytes());
+                                accepted.getOutputStream().write(statusResponse);accepted.shutdownOutput();
+                                return statusResponse;
+                            } catch(IOException e) { throw new UncheckedIOException(e); }
+                        });
+                        assertArrayEquals(statusResponse,g.exchangeRaw("test-device",lan.getHostAddress(),
+                                echo.getLocalPort(),statusQueries,1500));
+                        query.get(5,TimeUnit.SECONDS);
                     }finally {agent.destroy();assertTrue(agent.waitFor(5,TimeUnit.SECONDS));}
                 }finally {target.shutdownNow();}
             }
