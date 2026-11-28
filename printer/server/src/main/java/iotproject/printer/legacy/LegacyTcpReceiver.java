@@ -34,7 +34,7 @@ public class LegacyTcpReceiver {
     private static final int MAX_CLIENTS = 64;
 
     private final PrintJobRepository jobs;
-    private final LegacyInvoiceParser parser;
+    private final LegacyReceiptPreprocessor preprocessor;
     private final EscPosReceiptRenderer renderer;
     private final int port;
     private final String bind;
@@ -44,15 +44,20 @@ public class LegacyTcpReceiver {
         thread.setDaemon(true);
         return thread;
     });
+    private final ExecutorService printQueue = Executors.newSingleThreadExecutor(runnable -> {
+        Thread thread = new Thread(runnable, "legacy-print-queue");
+        thread.setDaemon(true);
+        return thread;
+    });
     private final Semaphore clientSlots = new Semaphore(MAX_CLIENTS);
     private volatile ServerSocket serverSocket;
 
-    public LegacyTcpReceiver(PrintJobRepository jobs, LegacyInvoiceParser parser,
+    public LegacyTcpReceiver(PrintJobRepository jobs, LegacyReceiptPreprocessor preprocessor,
                              EscPosReceiptRenderer renderer,
                              @Value("${printer.legacy.port:9100}") int port,
                              @Value("${printer.legacy.bind:0.0.0.0}") String bind) {
         this.jobs = jobs;
-        this.parser = parser;
+        this.preprocessor = preprocessor;
         this.renderer = renderer;
         this.port = port;
         this.bind = bind;
@@ -140,8 +145,9 @@ public class LegacyTcpReceiver {
 
     private void persist(List<String> lines, String sourceIp) {
         String rawPayload = String.join("\n", lines).replace(String.valueOf((char) 0), "\\u0000");
-        List<String> databaseSafeLines = lines.stream().map(line -> line.replace((char) 0, '\uFFFD')).toList();
-        var parsed = parser.parse(databaseSafeLines);
+        String databaseSafePayload = String.join("\n", lines).replace((char) 0, '\uFFFD');
+        var processed = preprocessor.process(databaseSafePayload);
+        var parsed = processed.payload();
         var id = jobs.createLegacyJob(rawPayload, parsed, sourceIp);
         @SuppressWarnings("unchecked")
         var validationErrors = (List<String>) parsed.get("validationErrors");
@@ -151,14 +157,16 @@ public class LegacyTcpReceiver {
                     String.join(", ", validationErrors));
             return;
         }
-        try {
-            byte[] artifact = renderer.render(parsed);
-            jobs.markRendered(id, artifact, sha256(artifact));
-            log.info("Queued legacy print job {} with {} lines and {} bytes", id, lines.size(), artifact.length);
-        } catch (RuntimeException e) {
-            jobs.markRenderFailed(id, e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage());
-            log.error("Could not render legacy print job {}", id, e);
-        }
+        printQueue.execute(() -> {
+            try {
+                byte[] artifact = renderer.render(parsed);
+                jobs.markRendered(id, artifact, sha256(artifact));
+                log.info("Queued legacy print job {} with {} lines and {} bytes", id, lines.size(), artifact.length);
+            } catch (RuntimeException e) {
+                jobs.markRenderFailed(id, e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage());
+                log.error("Could not render legacy print job {}", id, e);
+            }
+        });
     }
 
     private String sha256(byte[] bytes) {

@@ -93,6 +93,9 @@ class ConsoleTest(unittest.TestCase):
         page=self.client.get('/console/').text
         self.assertIn('name="reprint-mode" value="original"',page)
         self.assertIn('name="reprint-mode" value="image"',page)
+        self.assertIn('name="reprint-mode" value="driver"',page)
+        self.assertNotIn('name="reprint-mode" value="native"',page)
+        self.assertNotIn('<option value="native">',page)
         self.assertIn('id="receipt-editor"',page)
         self.assertIn('<dialog id="layout-editor">',page)
         self.assertIn('id="open-layout-editor"',page)
@@ -240,6 +243,26 @@ class ConsoleTest(unittest.TestCase):
         self.assertEqual(6,forwarded['nativeSettings']['lineSpacingDots'])
         self.assertNotIn('layout',forwarded)
 
+    def test_driver_reprint_forwards_layout_without_image_payload(self):
+        self.app.config.update(ADMIN_API_URL='http://printer-api.internal/internal/console',
+                               ADMIN_API_KEY='test-api-key')
+        self.login()
+        token=re.search(r'name="csrf" value="([^"]+)"',self.client.get('/console/').text).group(1)
+        class Response:
+            def __enter__(self): return self
+            def __exit__(self,*args): pass
+            def read(self): return b'{"result":"sent_unknown","mode":"driver","bytes":2048}'
+        payload={'jobId':'02da6474-4738-4b80-bb5d-2a7f97f13ef1','ip':'192.168.180.94',
+                 'port':9100,'mode':'driver'}
+        with patch('app.urllib.request.urlopen',return_value=Response()) as send:
+            response=self.client.post('/console/api/admin/reprint',json=payload,
+                                      headers={'X-CSRF-Token':token})
+        self.assertEqual(200,response.status_code)
+        forwarded=json.loads(send.call_args.args[0].data)
+        self.assertEqual('driver',forwarded['mode'])
+        self.assertIn('layout',forwarded)
+        self.assertNotIn('imageBase64',forwarded)
+
     def test_reprint_preview_proxies_backend_png_without_transforming_it(self):
         self.app.config.update(ADMIN_API_URL='http://printer-api.internal/internal/console',
                                ADMIN_API_KEY='test-api-key')
@@ -272,11 +295,13 @@ class ConsoleTest(unittest.TestCase):
         layout=json.dumps({'bodySize':22,'bodyBold':False})
         with patch('app.urllib.request.urlopen',return_value=Response()) as fetch:
             response=self.client.get('/console/api/admin/reprint-preview/'+job_id,
-                                     query_string={'layout':layout})
+                                     query_string={'layout':layout,'includePrintTime':'false'})
         self.assertEqual(200,response.status_code)
         forwarded=json.loads(parse_qs(urlparse(fetch.call_args.args[0].full_url).query)['layout'][0])
         self.assertEqual(22,forwarded['bodySize'])
         self.assertFalse(forwarded['bodyBold'])
+        preview_query=parse_qs(urlparse(fetch.call_args.args[0].full_url).query)
+        self.assertEqual('false',preview_query['includePrintTime'][0])
 
     def test_sample_reprint_preview_proxies_backend_png(self):
         self.app.config.update(ADMIN_API_URL='http://printer-api.internal/internal/console',
@@ -290,13 +315,14 @@ class ConsoleTest(unittest.TestCase):
         layout=json.dumps({'companySize':30,'tableSpaces':7})
         with patch('app.urllib.request.urlopen',return_value=Response()) as fetch:
             response=self.client.get('/console/api/admin/reprint-preview/sample',
-                                     query_string={'layout':layout})
+                                     query_string={'layout':layout,'includePrintTime':'false'})
         self.assertEqual(200,response.status_code)
         self.assertEqual('image/png',response.mimetype)
         self.assertEqual(image,response.data)
         parsed=parse_qs(urlparse(fetch.call_args.args[0].full_url).query)
         self.assertEqual(30,json.loads(parsed['layout'][0])['companySize'])
         self.assertEqual('image',parsed['format'][0])
+        self.assertEqual('false',parsed['includePrintTime'][0])
         self.assertTrue(fetch.call_args.args[0].full_url.startswith(
             'http://printer-api.internal/internal/console/reprint/preview/sample?'))
 

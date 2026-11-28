@@ -19,7 +19,8 @@ class NativeEscPosRendererTest {
         byte[] nativeBytes = nativeRenderer.render(receipt, layout);
         byte[] preview = nativeRenderer.preview(receipt, layout);
 
-        assertThat(new String(nativeBytes, Charset.forName("GBK"))).contains("销售单", "合计金额", "-".repeat(48));
+        assertThat(new String(nativeBytes, Charset.forName("GBK"))).contains("销售单", "-".repeat(48))
+                .doesNotContain("合计金额");
         assertThat(indexOf(nativeBytes, new byte[]{0x1b, 'M', 0})).isGreaterThanOrEqualTo(0);
         assertThat(indexOf(nativeBytes, new byte[]{0x1b, '3', 40})).isGreaterThanOrEqualTo(0);
         assertThat(indexOf(nativeBytes, new byte[]{0x1d, '!', 0x00})).isGreaterThanOrEqualTo(0);
@@ -127,8 +128,22 @@ class NativeEscPosRendererTest {
         String output = new String(new NativeEscPosRenderer().render(receipt, NativeEscPosRenderer.Settings.defaults()),
                 Charset.forName("GBK"));
 
-        assertThat(output).doesNotContain("仓库", "中央仓");
+        assertThat(output).doesNotContain("仓库", "中央仓", "合计金额");
         assertThat(output.indexOf("实收金额")).isLessThan(output.indexOf("地址：清流镇新街"));
+        byte[] address = "地址：清流镇新街".getBytes(Charset.forName("GBK"));
+        byte[] rendered = new NativeEscPosRenderer().render(receipt, NativeEscPosRenderer.Settings.defaults());
+        int addressOffset = indexOf(rendered, address);
+        assertThat(addressOffset).isGreaterThan(0);
+        assertThat(indexOfBefore(rendered, new byte[]{0x1b, 'J', 72}, addressOffset)).isGreaterThan(0);
+        assertThat(indexOfBefore(rendered, new byte[]{0x1b, 'M', 1}, addressOffset)).isGreaterThan(0);
+    }
+
+    private int indexOfBefore(byte[] source, byte[] target, int limit) {
+        outer: for (int i = 0; i <= Math.min(source.length, limit) - target.length; i++) {
+            for (int j = 0; j < target.length; j++) if (source[i + j] != target[j]) continue outer;
+            return i;
+        }
+        return -1;
     }
 
     @Test

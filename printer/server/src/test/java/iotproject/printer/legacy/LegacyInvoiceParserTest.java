@@ -36,7 +36,25 @@ class LegacyInvoiceParserTest {
 
         assertThat(parsed.get("lines")).isEqualTo(List.of("legacy line"));
         assertThat(parsed.get("items")).isEqualTo(List.of());
-        assertThat(parsed.get("validationErrors")).asList().contains("缺少单号", "缺少客户名称", "缺少地址", "合计金额格式无效", "缺少商品明细");
+        assertThat(parsed.get("validationErrors")).asList().contains("缺少单号", "缺少地址", "合计金额格式无效", "缺少商品明细");
+    }
+
+    @Test
+    void createsStructuredItemRowsIncludingSplitNameAndAmounts() {
+        var parsed = parser.parse(List.of("单号:XS004", "品名 数量 单价 金额", "20多联B管(根)",
+                "1 4.50 4.50", "合计:4.50", "地址:测试地址"));
+
+        assertThat(parsed.get("itemRows")).asList().containsExactly(
+                java.util.Map.of("name", "20多联B管(根)", "quantity", "1", "unit", "",
+                        "unitPrice", "4.50", "amount", "4.50"));
+        assertThat(parsed.get("validationErrors")).asList().isEmpty();
+    }
+
+    @Test
+    void acceptsMissingCustomerName() {
+        var parsed = parser.parse(List.of("单号:XS005", "品名 数量", "测试商品 1",
+                "合计:1", "地址:测试地址"));
+        assertThat(parsed.get("validationErrors")).asList().isEmpty();
     }
 
     @Test

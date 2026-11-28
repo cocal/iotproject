@@ -14,6 +14,8 @@ import static iotproject.printer.tunnel.TunnelFrame.*;
 /** TLS sessions and explicit, loopback-only target mappings. No print semantics. */
 public final class TunnelGateway implements AutoCloseable {
     private static final Logger log=LoggerFactory.getLogger(TunnelGateway.class);
+    private static final int MAX_STREAMS_PER_SESSION=3;
+    private static final int PRINT_ACK_TIMEOUT_SECONDS=12;
     private static final String[] TLS12_CIPHER_SUITES={
             "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
             "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384"
@@ -111,7 +113,7 @@ public final class TunnelGateway implements AutoCloseable {
     public boolean online(String device) {return sessions.containsKey(device);}
     public boolean available(String device) {
         Session session=sessions.get(device);
-        return session!=null && session.stream==null && !session.socket.isClosed();
+        return session!=null && session.streams.size()<MAX_STREAMS_PER_SESSION && !session.socket.isClosed();
     }
     public boolean hasMapping(String device) {
         return mappings.stream().anyMatch(mapping -> mapping.deviceId().equals(device));
@@ -124,16 +126,7 @@ public final class TunnelGateway implements AutoCloseable {
                 .orElseThrow(() -> new IOException("No authorized printer mapping for device"));
         if(!hasSingleMapping(device))
             throw new IOException("Exactly one printer mapping is required for device");
-        int index=mappings.indexOf(mapping);
-        try(Socket local=new Socket()) {
-            local.connect(new InetSocketAddress("127.0.0.1",mappingPorts.get(index)),2_000);
-            local.setSoTimeout(2_000);
-            local.getOutputStream().write(data);
-            local.getOutputStream().flush();
-            local.shutdownOutput();
-            try { local.getInputStream().transferTo(OutputStream.nullOutputStream()); }
-            catch(SocketTimeoutException ignored) { /* Printer protocols commonly have no response. */ }
-        }
+        sendRaw(device,mapping.targetIp(),mapping.targetPort(),data);
     }
     private void accept(ServerSocket server,Mapping mapping) {
         while(running.get()) {
@@ -155,17 +148,31 @@ public final class TunnelGateway implements AutoCloseable {
         }
     }
     private void bridge(Socket local,Mapping mapping) throws Exception {
-        bridge(local,mapping,null);
+        bridge(local,mapping,null,null,false);
     }
     private void bridge(Socket local,Mapping mapping,CompletableFuture<Void> opened) throws Exception {
+        bridge(local,mapping,opened,null,false);
+    }
+    private void bridge(Socket local,Mapping mapping,CompletableFuture<Void> opened,
+                        CompletableFuture<Void> acknowledged,boolean discardTargetResponse) throws Exception {
         Session session=sessions.get(mapping.deviceId());
-        if(session==null) {if(opened!=null) opened.completeExceptionally(new IOException("Device offline"));return;}
+        if(session==null) {
+            IOException failure=new IOException("Device offline");
+            if(opened!=null) opened.completeExceptionally(failure);
+            if(acknowledged!=null) acknowledged.completeExceptionally(failure);
+            return;
+        }
         Stream stream=session.open(local,mapping);
-        if(stream==null) {if(opened!=null) opened.completeExceptionally(new IOException("Device busy"));return;}
+        if(stream==null) {
+            IOException failure=new IOException("Device busy");
+            if(opened!=null) opened.completeExceptionally(failure);
+            if(acknowledged!=null) acknowledged.completeExceptionally(failure);
+            return;
+        }
         try {
             stream.opened.get(7,TimeUnit.SECONDS);
             if(opened!=null) opened.complete(null);
-            workers.execute(() -> stream.deliver());
+            workers.execute(() -> stream.deliver(discardTargetResponse));
             byte[] buffer=new byte[CHUNK];
             while(true) {
                 int limit=stream.awaitCredit();
@@ -184,9 +191,14 @@ public final class TunnelGateway implements AutoCloseable {
                     session.send(new TunnelFrame(DATA,stream.id,Arrays.copyOf(buffer,count)));
                 }
             }
+            if(acknowledged!=null) {
+                stream.awaitAllDataAcknowledged(PRINT_ACK_TIMEOUT_SECONDS,TimeUnit.SECONDS);
+                acknowledged.complete(null);
+            }
             stream.done.get();
         } catch(Exception e) {
             if(opened!=null) opened.completeExceptionally(e);
+            if(acknowledged!=null) acknowledged.completeExceptionally(e);
             log.debug("Local tunnel sender stopped: {}",e.getClass().getSimpleName());
             if(e instanceof SocketException) log.debug("Local socket state: {}",e.getMessage());
             session.reset(stream,"TARGET_IO");
@@ -197,7 +209,7 @@ public final class TunnelGateway implements AutoCloseable {
         return true;
     }
     public void sendRaw(String device,String targetIp,int targetPort,byte[] data) throws IOException {
-        exchange(device,targetIp,targetPort,data,750);
+        exchange(device,targetIp,targetPort,data,true);
     }
     public byte[] exchangeRaw(String device,String targetIp,int targetPort,byte[] data,int responseTimeoutMs) throws IOException {
         if(data==null || data.length==0 || data.length>64 || responseTimeoutMs<100 || responseTimeoutMs>5000)
@@ -205,14 +217,26 @@ public final class TunnelGateway implements AutoCloseable {
         return exchange(device,targetIp,targetPort,data,responseTimeoutMs);
     }
     private byte[] exchange(String device,String targetIp,int targetPort,byte[] data,int responseTimeoutMs) throws IOException {
+        return exchangeInternal(device,targetIp,targetPort,data,responseTimeoutMs,false);
+    }
+    private byte[] exchange(String device,String targetIp,int targetPort,byte[] data,
+                            boolean waitForDataAcknowledgement) throws IOException {
+        return exchangeInternal(device,targetIp,targetPort,data,0,waitForDataAcknowledgement);
+    }
+    private byte[] exchangeInternal(String device,String targetIp,int targetPort,byte[] data,int responseTimeoutMs,
+                                    boolean waitForDataAcknowledgement) throws IOException {
         Mapping target=new Mapping(device,0,targetIp,targetPort);
         if(!available(device)) throw new IOException("Device offline or tunnel busy");
         CompletableFuture<Void> opened=new CompletableFuture<>();
+        CompletableFuture<Void> acknowledged=waitForDataAcknowledgement?new CompletableFuture<>():null;
         try(ServerSocket listener=new ServerSocket()) {
             listener.bind(new InetSocketAddress("127.0.0.1",0));
             Future<?> bridge=workers.submit(()->{
-                try(Socket local=listener.accept()) {bridge(local,target,opened);}
-                catch(Exception e) {opened.completeExceptionally(e);}
+                try(Socket local=listener.accept()) {bridge(local,target,opened,acknowledged,waitForDataAcknowledgement);}
+                catch(Exception e) {
+                    opened.completeExceptionally(e);
+                    if(acknowledged!=null) acknowledged.completeExceptionally(e);
+                }
             });
             try(Socket client=new Socket()) {
                 client.connect(new InetSocketAddress("127.0.0.1",listener.getLocalPort()),1000);
@@ -220,6 +244,16 @@ public final class TunnelGateway implements AutoCloseable {
                 catch(Exception e) {throw new IOException("Tunnel target connection failed",e);}
                 if(data.length>0) {client.getOutputStream().write(data);client.getOutputStream().flush();}
                 client.shutdownOutput();
+                if(waitForDataAcknowledgement) {
+                    try {acknowledged.get(PRINT_ACK_TIMEOUT_SECONDS+1L,TimeUnit.SECONDS);}
+                    catch(TimeoutException e) {throw new IOException("Printer data was not acknowledged by the target TCP stack",e);}
+                    catch(ExecutionException e) {throw new IOException("Printer data transfer failed",e.getCause());}
+                    catch(InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        throw new IOException("Interrupted while waiting for printer TCP acknowledgements",e);
+                    }
+                    return new byte[0];
+                }
                 client.setSoTimeout(responseTimeoutMs);
                 ByteArrayOutputStream response=new ByteArrayOutputStream();
                 byte[] buffer=new byte[512];
@@ -227,7 +261,9 @@ public final class TunnelGateway implements AutoCloseable {
                 catch(SocketTimeoutException ignored) { }
                 return response.toByteArray();
             } finally {
-                try {bridge.get(1,TimeUnit.SECONDS);} catch(Exception ignored) {bridge.cancel(true);}
+                if(!waitForDataAcknowledgement || acknowledged==null || !acknowledged.isDone()) {
+                    try {bridge.get(1,TimeUnit.SECONDS);} catch(Exception ignored) {bridge.cancel(true);}
+                }
             }
         }
     }
@@ -236,7 +272,7 @@ public final class TunnelGateway implements AutoCloseable {
         final Object writeLock=new Object();
         volatile long writingSince;
         volatile long lastPing=System.nanoTime();
-        volatile Stream stream;
+        final ConcurrentMap<Integer,Stream> streams=new ConcurrentHashMap<>();
         String device;
         int nextId=1;
         Session(SSLSocket socket) {this.socket=socket;}
@@ -245,7 +281,7 @@ public final class TunnelGateway implements AutoCloseable {
             try {
                 socket.setSoTimeout(10_000); socket.startHandshake();
                 stage="device authentication";
-                TunnelFrame auth=TunnelFrame.read(socket.getInputStream());
+                TunnelFrame auth=WireProtocol.read(socket.getInputStream(),socket,null);
                 if(auth.type()!=AUTH) throw new IOException("AUTH required");
                 var json=auth.json(); device=text(json,"device_id",64);
                 if(!device.matches("[A-Za-z0-9_.-]+")) throw new IOException("Invalid device");
@@ -262,7 +298,7 @@ public final class TunnelGateway implements AutoCloseable {
                 log.info("Tunnel device online: {}",device);
                 stage="tunnel session";
                 socket.setSoTimeout(90_000);
-                while(!socket.isClosed()) receive(TunnelFrame.read(socket.getInputStream()));
+                while(!socket.isClosed()) receive(WireProtocol.read(socket.getInputStream(),socket,device));
             } catch(Exception failure) {
                 if(stage.equals("TLS handshake") || stage.equals("device authentication")) {
                     log.warn("Tunnel connection from {} failed during {}: {}",socket.getRemoteSocketAddress(),
@@ -278,14 +314,14 @@ public final class TunnelGateway implements AutoCloseable {
                         || node.longValue()<0 || node.longValue()>0xffffffffL) throw new IOException("Invalid nonce");
                 lastPing=System.nanoTime();send(TunnelFrame.json(PONG,0,Map.of("nonce",node.longValue())));return;
             }
-            Stream s=stream;
-            if(s==null || s.id!=frame.streamId()) throw new IOException("Unknown stream");
+            Stream s=streams.get(frame.streamId());
+            if(s==null) throw new IOException("Unknown stream");
             synchronized(s) {
                 if(s.reset && frame.type()!=CLOSED) return; // drain in-flight bytes after RESET
                 switch(frame.type()) {
                     case OPEN_OK -> {
                         if(s.opened.isDone()) throw new IOException("Duplicate OPEN_OK");
-                        s.sendCredit=number(frame.json(),"initial_window",WINDOW_SIZE,WINDOW_SIZE);
+                        s.sendCredit=number(frame.json(),"initial_window",512,WINDOW_SIZE);
                         s.opened.complete(null); s.notifyAll();
                     }
                     case OPEN_ERROR -> {
@@ -293,7 +329,7 @@ public final class TunnelGateway implements AutoCloseable {
                         String code=text(frame.json(),"code",64);
                         log.warn("Tunnel target connection rejected: device={}, target={}:{}, stream={}, code={}",
                                 device,s.mapping.targetIp(),s.mapping.targetPort(),s.id,code);
-                        stream=null;s.fail();
+                        streams.remove(s.id,s);s.fail();
                     }
                     case DATA -> {
                         if(!s.opened.isDone() || s.remoteFin || frame.payload().length>s.receiveCredit)
@@ -321,7 +357,7 @@ public final class TunnelGateway implements AutoCloseable {
                     case CLOSED -> {
                         log.debug("Device CLOSED stream {}, queued {}",s.id,s.incoming.size());
                         if(!s.reset && (!s.localFin || !s.remoteFin)) throw new IOException("Early CLOSED");
-                        stream=null;
+                        streams.remove(s.id,s);
                         // Deliver queued data and FIN before completing the local connection.
                         if(s.reset) s.fail(); else s.peerClosed=true;
                         s.notifyAll();
@@ -331,9 +367,9 @@ public final class TunnelGateway implements AutoCloseable {
             }
         }
         synchronized Stream open(Socket local,Mapping mapping) throws IOException {
-            if(stream!=null || socket.isClosed()) return null;
+            if(streams.size()>=MAX_STREAMS_PER_SESSION || socket.isClosed()) return null;
             if(nextId==0) {shutdown();return null;}
-            Stream s=new Stream(this,nextId++,local,mapping);stream=s;
+            Stream s=new Stream(this,nextId++,local,mapping);streams.put(s.id,s);
             send(TunnelFrame.json(OPEN,s.id,Map.of("target_ip",mapping.targetIp(),"target_port",mapping.targetPort(),
                     "connect_timeout_ms",1500,"idle_timeout_sec",120,"initial_window",WINDOW_SIZE)));
             return s;
@@ -341,29 +377,30 @@ public final class TunnelGateway implements AutoCloseable {
         void send(TunnelFrame frame) throws IOException {
             synchronized(writeLock) {
                 writingSince=System.nanoTime();
-                try {frame.write(socket.getOutputStream());}
+                try {WireProtocol.write(frame,socket.getOutputStream(),socket);}
                 finally {writingSince=0;}
             }
         }
         void reset(Stream s,String code) {
             log.debug("Resetting target stream {}: {}",s.id,code);
-            synchronized(s) {if(stream!=s || s.reset) return;s.reset=true;s.resetAt=System.nanoTime();s.fail();}
+            synchronized(s) {if(!streams.remove(s.id,s) || s.reset) return;s.reset=true;s.resetAt=System.nanoTime();s.fail();}
             try {send(TunnelFrame.json(RESET,s.id,Map.of("code",code)));} catch(IOException e) {shutdown();}
         }
         void tick() {
             long now=System.nanoTime();
             if(now-lastPing>TimeUnit.SECONDS.toNanos(90)
                     || (writingSince!=0 && now-writingSince>TimeUnit.SECONDS.toNanos(10))) {shutdown();return;}
-            Stream s=stream; if(s==null) return;
-            if(s.reset && now-s.resetAt>TimeUnit.SECONDS.toNanos(10)) {shutdown();return;}
-            if(!s.opened.isDone() && now-s.lastActivity>TimeUnit.SECONDS.toNanos(7)) {shutdown();return;}
-            if(!s.reset && now-s.lastActivity>TimeUnit.SECONDS.toNanos(s.localFin||s.remoteFin ? 10 : 120))
-                workers.execute(() -> reset(s,"IDLE_TIMEOUT"));
+            for(Stream s:streams.values()) {
+                if(s.reset && now-s.resetAt>TimeUnit.SECONDS.toNanos(10)) {shutdown();return;}
+                if(!s.opened.isDone() && now-s.lastActivity>TimeUnit.SECONDS.toNanos(7)) {shutdown();return;}
+                if(!s.reset && now-s.lastActivity>TimeUnit.SECONDS.toNanos(s.localFin||s.remoteFin ? 10 : 120))
+                    workers.execute(() -> reset(s,"IDLE_TIMEOUT"));
+            }
         }
         void shutdown() {
             closeSocket(socket);
             if(device!=null && sessions.remove(device,this)) log.info("Tunnel device offline: {}",device);
-            Stream s=stream;if(s!=null) s.fail();
+            streams.values().forEach(Stream::fail);streams.clear();
         }
     }
     private final class Stream {
@@ -380,14 +417,25 @@ public final class TunnelGateway implements AutoCloseable {
             while(sendCredit==0 && !reset && !done.isDone()) wait();
             if(reset || done.isDone()) throw new IOException("Stream closed");return sendCredit;
         }
-        void deliver() {
+        synchronized void awaitAllDataAcknowledged(long timeout,TimeUnit unit) throws IOException,InterruptedException {
+            long deadline=System.nanoTime()+unit.toNanos(timeout),remaining=unit.toNanos(timeout);
+            while(sendCredit<WINDOW_SIZE && !peerClosed && !reset && remaining>0) {
+                TimeUnit.NANOSECONDS.timedWait(this,remaining);
+                remaining=deadline-System.nanoTime();
+            }
+            if(sendCredit==WINDOW_SIZE || (peerClosed && localFin && !reset)) return;
+            throw new IOException(reset
+                    ? "Target stream reset before all printer data was acknowledged"
+                    : "Timed out waiting for printer TCP acknowledgements or clean stream close");
+        }
+        void deliver(boolean discardTargetResponse) {
             try {
                 while(!reset) {
                     TunnelFrame frame=incoming.poll(200,TimeUnit.MILLISECONDS);
                     if(frame!=null) {
                         if(frame.type()==FIN) local.shutdownOutput();
                         else {
-                            local.getOutputStream().write(frame.payload());
+                            if(!discardTargetResponse) local.getOutputStream().write(frame.payload());
                             synchronized(this) {receiveCredit+=frame.payload().length;}
                             // CLOSED can already be queued by the device; no window is needed after it.
                             synchronized(this) {

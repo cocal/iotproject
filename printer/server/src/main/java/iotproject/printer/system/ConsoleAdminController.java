@@ -4,6 +4,7 @@ import iotproject.printer.jobs.PrintJobRepository;
 import iotproject.printer.render.EscPosReceiptRenderer;
 import iotproject.printer.render.LegacyEscPosRenderer;
 import iotproject.printer.render.NativeEscPosRenderer;
+import iotproject.printer.render.PrinterDriverRenderer;
 import iotproject.printer.tunnel.TunnelGateway;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.beans.factory.annotation.Value;
@@ -35,6 +36,7 @@ public class ConsoleAdminController {
     private final EscPosReceiptRenderer renderer;
     private final LegacyEscPosRenderer legacyRenderer = new LegacyEscPosRenderer();
     private final NativeEscPosRenderer nativeRenderer = new NativeEscPosRenderer();
+    private final PrinterDriverRenderer driverRenderer;
     private final JdbcTemplate jdbc;
     private final ObjectMapper objectMapper;
     private final String apiKey;
@@ -44,11 +46,12 @@ public class ConsoleAdminController {
     private final ConcurrentMap<UUID,ScanState> scans=new ConcurrentHashMap<>();
 
     public ConsoleAdminController(TunnelGateway tunnel, PrintJobRepository jobs, EscPosReceiptRenderer renderer,
-                                  JdbcTemplate jdbc, ObjectMapper objectMapper,
+                                  JdbcTemplate jdbc, ObjectMapper objectMapper, PrinterDriverRenderer driverRenderer,
                                   @Value("${printer.console-admin.api-key:}") String apiKey,
                                   @Value("${printer.console-admin.allowed-cidrs:}") String cidrs) {
         this.tunnel=tunnel;this.jobs=jobs;this.renderer=renderer;this.jdbc=jdbc;this.objectMapper=objectMapper;this.apiKey=apiKey;
         this.allowedCidrs=Arrays.stream(cidrs.split(",")).map(String::trim).filter(s->!s.isEmpty()).toList();
+        this.driverRenderer=driverRenderer;
     }
 
     @PostMapping("/scan")
@@ -183,7 +186,13 @@ public class ConsoleAdminController {
                 String raw=jdbc.query("SELECT raw_payload FROM print_jobs WHERE id = ?",
                         rs -> rs.next()?rs.getString(1):null,request.jobId());
                 if(raw==null)return ResponseEntity.notFound().build();
-                output=legacyRenderer.renderReceipt(raw,request.layout());
+                output=legacyRenderer.renderReceipt(raw,request.layout(),request.includePrintTime()==null||request.includePrintTime());
+            } else if("driver".equals(mode)) {
+                String raw=jdbc.query("SELECT raw_payload FROM print_jobs WHERE id = ?",
+                        rs -> rs.next()?rs.getString(1):null,request.jobId());
+                if(raw==null)return ResponseEntity.notFound().build();
+                byte[] preview=legacyRenderer.renderReceiptPreview(raw,request.layout(),request.includePrintTime()==null||request.includePrintTime());
+                output=driverRenderer.render(preview);
             } else if("artifact".equals(mode)) {
                 var artifact=jobs.findArtifact(request.jobId());
                 if(artifact.isEmpty())return ResponseEntity.notFound().build();
@@ -195,7 +204,7 @@ public class ConsoleAdminController {
             return ResponseEntity.badRequest().body(Map.of("error",e.getMessage()==null?"invalid_image":e.getMessage()));
         } catch(java.io.IOException e) {
             log.info("Printer API endpoint=reprint mode={} outcome=render_failed renderMs={} totalMs={}",mode,elapsedMs(renderStarted),elapsedMs(callStarted));
-            return ResponseEntity.badRequest().body(Map.of("error","invalid_image"));
+            return ResponseEntity.badRequest().body(Map.of("error","driver".equals(mode)?"driver_conversion_failed":"invalid_image"));
         }
         long sendStarted=System.nanoTime();
         try {
@@ -216,7 +225,8 @@ public class ConsoleAdminController {
     public ResponseEntity<?> reprintPreview(@RequestHeader("X-Console-Key") String key,@RequestParam UUID jobId,
                                             @RequestParam(required=false) String layout,
                                             @RequestParam(required=false) String nativeLayout,
-                                            @RequestParam(required=false, defaultValue="image") String format) {
+                                            @RequestParam(required=false, defaultValue="image") String format,
+                                            @RequestParam(required=false, defaultValue="true") boolean includePrintTime) {
         long callStarted=System.nanoTime();
         if(!authorized(key)) return ResponseEntity.status(401).build();
         try {
@@ -230,7 +240,7 @@ public class ConsoleAdminController {
             NativeEscPosRenderer.Settings nativeSettings = nativeLayout == null || nativeLayout.isBlank()
                     ? NativeEscPosRenderer.Settings.defaults()
                     : objectMapper.readValue(nativeLayout, NativeEscPosRenderer.Settings.class).validated();
-            byte[] png="native".equals(format)?nativeRenderer.preview(raw,nativeSettings):legacyRenderer.renderReceiptPreview(raw,settings);
+            byte[] png="native".equals(format)?nativeRenderer.preview(raw,nativeSettings):legacyRenderer.renderReceiptPreview(raw,settings,includePrintTime);
             log.info("Printer API endpoint=reprint_preview jobId={} sourceChars={} pngBytes={} renderMs={} totalMs={} outcome=ok",
                     jobId,raw.length(),png.length,elapsedMs(renderStarted),elapsedMs(callStarted));
             return ResponseEntity.ok().contentType(MediaType.IMAGE_PNG).body(png);
@@ -250,7 +260,8 @@ public class ConsoleAdminController {
     public ResponseEntity<?> sampleReprintPreview(@RequestHeader("X-Console-Key") String key,
                                                    @RequestParam(required=false) String layout,
                                                    @RequestParam(required=false) String nativeLayout,
-                                                   @RequestParam(required=false, defaultValue="image") String format) {
+                                                   @RequestParam(required=false, defaultValue="image") String format,
+                                                   @RequestParam(required=false, defaultValue="true") boolean includePrintTime) {
         long callStarted=System.nanoTime();
         if(!authorized(key)) return ResponseEntity.status(401).build();
         String sample="清流镇同利五金电器销售部\n销售单\n单号：PREVIEW-001\n客户：排版预览\n品名 数量 单价 金额\n示例商品 2 12.50 25.00\n合计金额：25.00\n此为排版预览，不会打印";
@@ -262,7 +273,7 @@ public class ConsoleAdminController {
             NativeEscPosRenderer.Settings nativeSettings = nativeLayout == null || nativeLayout.isBlank()
                     ? NativeEscPosRenderer.Settings.defaults()
                     : objectMapper.readValue(nativeLayout, NativeEscPosRenderer.Settings.class).validated();
-            byte[] png="native".equals(format)?nativeRenderer.preview(sample,nativeSettings):legacyRenderer.renderReceiptPreview(sample,settings);
+            byte[] png="native".equals(format)?nativeRenderer.preview(sample,nativeSettings):legacyRenderer.renderReceiptPreview(sample,settings,includePrintTime);
             log.info("Printer API endpoint=reprint_preview_sample sourceChars={} pngBytes={} renderMs={} totalMs={} outcome=ok",
                     sample.length(),png.length,elapsedMs(renderStarted),elapsedMs(callStarted));
             return ResponseEntity.ok().contentType(MediaType.IMAGE_PNG).body(png);
@@ -304,5 +315,5 @@ public class ConsoleAdminController {
     public record Scan(String deviceId,String cidr,String operator){}
     public record PrintTarget(String deviceId,String ip,int port,String operator){}
     public record Reprint(String deviceId,String ip,int port,UUID jobId,String operator,String mode,
-                          LegacyEscPosRenderer.LayoutSettings layout,NativeEscPosRenderer.Settings nativeSettings){}
+                          LegacyEscPosRenderer.LayoutSettings layout,NativeEscPosRenderer.Settings nativeSettings,Boolean includePrintTime){}
 }

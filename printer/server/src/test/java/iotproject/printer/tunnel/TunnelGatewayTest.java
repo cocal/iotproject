@@ -137,7 +137,11 @@ class TunnelGatewayTest {
             assertEquals(AUTH_OK,TunnelFrame.read(d.getInputStream()).type());await(()->g.online("test-device"));
             try(var local=new Socket("127.0.0.1",g.mappingPort(0))) {
                 var open=TunnelFrame.read(d.getInputStream());assertEquals(OPEN,open.type());
-                try(var busy=new Socket("127.0.0.1",g.mappingPort(0))) {busy.setSoTimeout(2000);assertEquals(-1,busy.getInputStream().read());}
+                try(var parallel=new Socket("127.0.0.1",g.mappingPort(0))) {
+                    var parallelOpen=TunnelFrame.read(d.getInputStream());assertEquals(OPEN,parallelOpen.type());
+                    TunnelFrame.json(OPEN_ERROR,parallelOpen.streamId(),Map.of("code","REFUSED")).write(d.getOutputStream());
+                    parallel.setSoTimeout(2000);assertEquals(-1,parallel.getInputStream().read());
+                }
                 TunnelFrame.json(OPEN_ERROR,open.streamId(),Map.of("code","REFUSED")).write(d.getOutputStream());
                 local.setSoTimeout(2000);assertEquals(-1,local.getInputStream().read());
             }
@@ -147,6 +151,57 @@ class TunnelGatewayTest {
                 TunnelFrame.json(WINDOW,open.streamId(),Map.of("credit",1)).write(d.getOutputStream());
                 assertEquals(-1,d.getInputStream().read());local.setSoTimeout(2000);assertEquals(-1,local.getInputStream().read());
             }
+        }
+    }
+    @Test void permitsThreeParallelStreamsAndRejectsTheFourth() throws Exception {
+        try(var g=gateway(List.of(new TunnelGateway.Mapping("test-device",0,"192.168.1.50",9100)));
+            var d=device(g,"test-key")) {
+            assertEquals(AUTH_OK,TunnelFrame.read(d.getInputStream()).type());await(()->g.online("test-device"));
+            List<Socket> active=new ArrayList<>();
+            try {
+                for(int i=0;i<3;i++) {
+                    Socket local=new Socket("127.0.0.1",g.mappingPort(0));active.add(local);
+                    TunnelFrame open=TunnelFrame.read(d.getInputStream());assertEquals(OPEN,open.type());
+                    TunnelFrame.json(OPEN_OK,open.streamId(),Map.of("initial_window",4096)).write(d.getOutputStream());
+                }
+                try(var fourth=new Socket("127.0.0.1",g.mappingPort(0))) {
+                    fourth.setSoTimeout(2000);assertEquals(-1,fourth.getInputStream().read());
+                }
+            } finally {
+                for(Socket socket:active)socket.close();
+            }
+        }
+    }
+    @Test void rawPrintWaitsForTcpWindowAcknowledgementsAndAcceptsCleanStreamClose() throws Exception {
+        try(var g=gateway(List.of(new TunnelGateway.Mapping("test-device",0,"192.168.1.50",9100)));
+            var d=device(g,"test-key")) {
+            assertEquals(AUTH_OK,TunnelFrame.read(d.getInputStream()).type());await(()->g.online("test-device"));
+            byte[] payload=new byte[52_208];new Random(22).nextBytes(payload);
+            ExecutorService sender=Executors.newSingleThreadExecutor();
+            try {
+                Future<?> request=sender.submit(()->{
+                    try {g.sendRaw("test-device","192.168.1.50",9100,payload);}
+                    catch(IOException e) {throw new UncheckedIOException(e);}
+                });
+                TunnelFrame open=TunnelFrame.read(d.getInputStream());assertEquals(OPEN,open.type());
+                TunnelFrame.json(OPEN_OK,open.streamId(),Map.of("initial_window",4096)).write(d.getOutputStream());
+                ByteArrayOutputStream received=new ByteArrayOutputStream();boolean delayed=false;int pendingCredit=0;
+                while(true) {
+                    TunnelFrame frame=TunnelFrame.read(d.getInputStream());
+                    if(frame.type()==FIN) {
+                        new TunnelFrame(FIN,open.streamId(),new byte[0]).write(d.getOutputStream());
+                        new TunnelFrame(CLOSED,open.streamId(),new byte[0]).write(d.getOutputStream());
+                        break;
+                    }
+                    assertEquals(DATA,frame.type());received.write(frame.payload());
+                    if(!delayed) {Thread.sleep(900);delayed=true;}
+                    if(pendingCredit>0)
+                        TunnelFrame.json(WINDOW,open.streamId(),Map.of("credit",pendingCredit)).write(d.getOutputStream());
+                    pendingCredit=frame.payload().length;
+                }
+                assertArrayEquals(payload,received.toByteArray());
+                request.get(1500,TimeUnit.MILLISECONDS);
+            } finally {sender.shutdownNow();}
         }
     }
     @Test void exhaustedWindowStillRespondsToHeartbeat() throws Exception {

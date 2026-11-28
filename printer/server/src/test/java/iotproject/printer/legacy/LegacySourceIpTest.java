@@ -15,7 +15,7 @@ class LegacySourceIpTest {
         var jobs=mock(PrintJobRepository.class);
         UUID id=UUID.randomUUID();
         when(jobs.createLegacyJob(anyString(),anyMap(),anyString())).thenReturn(id);
-        var receiver=new LegacyTcpReceiver(jobs,new LegacyInvoiceParser(),new EscPosReceiptRenderer(),0,"127.0.0.1");
+        var receiver=new LegacyTcpReceiver(jobs,new LegacyReceiptPreprocessor(new LegacyInvoiceParser()),new EscPosReceiptRenderer(),0,"127.0.0.1");
         try(var listener=new ServerSocket(0,1,InetAddress.getByName("127.0.0.1"));
             var sender=new Socket("127.0.0.1",listener.getLocalPort());var accepted=listener.accept()) {
             var method=LegacyTcpReceiver.class.getDeclaredMethod("handle",Socket.class);method.setAccessible(true);
@@ -36,7 +36,7 @@ class LegacySourceIpTest {
             var jobs=mock(PrintJobRepository.class);
             UUID id=UUID.randomUUID();
             when(jobs.createLegacyJob(anyString(),anyMap(),anyString())).thenReturn(id);
-            var receiver=new LegacyTcpReceiver(jobs,new LegacyInvoiceParser(),new EscPosReceiptRenderer(),0,"127.0.0.1");
+            var receiver=new LegacyTcpReceiver(jobs,new LegacyReceiptPreprocessor(new LegacyInvoiceParser()),new EscPosReceiptRenderer(),0,"127.0.0.1");
             try(var listener=new ServerSocket(0,1,InetAddress.getByName("127.0.0.1"));
                 var sender=new Socket("127.0.0.1",listener.getLocalPort());var accepted=listener.accept()) {
                 var method=LegacyTcpReceiver.class.getDeclaredMethod("handle",Socket.class);method.setAccessible(true);
@@ -47,7 +47,7 @@ class LegacySourceIpTest {
                 sender.getOutputStream().write(raw.getBytes(Charset.forName("GBK")));sender.shutdownOutput();
                 handling.get(3,TimeUnit.SECONDS);
                 verify(jobs).createLegacyJob(eq(raw.stripTrailing()),argThat(data->data.get("customer").equals("测试客户")),eq("127.0.0.1"));
-                if(addressLine) verify(jobs).markRendered(eq(id),any(byte[].class),anyString());
+                if(addressLine) verify(jobs,timeout(3000)).markRendered(eq(id),any(byte[].class),anyString());
                 else verify(jobs).markDiscarded(eq(id),contains("缺少地址"));
             } finally {receiver.stop();}
         }

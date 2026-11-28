@@ -334,7 +334,7 @@ def create_app(overrides=None):
     def reprint():
         csrf()
         payload = request.json or {}
-        if payload.get('mode') == 'image':
+        if payload.get('mode') in ('image', 'driver'):
             payload.setdefault('layout', DEFAULT_RECEIPT_LAYOUT)
         if payload.get('mode') == 'native':
             payload.setdefault('nativeSettings', DEFAULT_NATIVE_LAYOUT)
@@ -345,6 +345,9 @@ def create_app(overrides=None):
     def reprint_preview(job_id):
         layout = request.args.get('layout')
         query = {'jobId': str(job_id), 'format': request.args.get('format', 'image')}
+        include_print_time = request.args.get('includePrintTime')
+        if include_print_time in ('true', 'false'):
+            query['includePrintTime'] = include_print_time
         native_layout = request.args.get('nativeLayout')
         if native_layout:
             try:
@@ -369,6 +372,9 @@ def create_app(overrides=None):
     def reprint_preview_sample():
         layout = request.args.get('layout')
         query = {'format': request.args.get('format', 'image')}
+        include_print_time = request.args.get('includePrintTime')
+        if include_print_time in ('true', 'false'):
+            query['includePrintTime'] = include_print_time
         native_layout = request.args.get('nativeLayout')
         if native_layout:
             try:

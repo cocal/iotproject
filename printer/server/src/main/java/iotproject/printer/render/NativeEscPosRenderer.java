@@ -98,9 +98,13 @@ public class NativeEscPosRenderer {
             }
             write(out, ESC, 'a', align(alignment(line, settings)));
             write(out, ESC, 'E', bold(line, settings) ? 1 : 0);
-            write(out, ESC, 'M', fontCode(settings.font()));
-            write(out, GS, '!', ((width(line, settings) - 1) << 4) | (height(line, settings) - 1));
-            write(out, ESC, '3', Math.min(255, baseHeight(settings) * height(line, settings) + settings.lineSpacingDots()));
+            boolean address = "address".equals(line.kind());
+            write(out, ESC, 'M', address ? 1 : fontCode(settings.font()));
+            int width = address ? 1 : width(line, settings);
+            int height = address ? 1 : height(line, settings);
+            int lineHeight = address ? 17 : baseHeight(settings) * height;
+            write(out, GS, '!', ((width - 1) << 4) | (height - 1));
+            write(out, ESC, '3', Math.min(255, lineHeight + settings.lineSpacingDots()));
             out.writeBytes(line.text().getBytes(GBK));
             out.write('\n');
         }
@@ -137,19 +141,22 @@ public class NativeEscPosRenderer {
                     y += baseHeight(settings) + settings.lineSpacingDots();
                     continue;
                 }
-                int widthScale = width(line, settings), heightScale = height(line, settings);
-                Font font = new Font("Noto Sans CJK SC", bold(line, settings) ? Font.BOLD : Font.PLAIN, baseHeight(settings));
+                boolean address = "address".equals(line.kind());
+                int widthScale = address ? 1 : width(line, settings), heightScale = address ? 1 : height(line, settings);
+                int fontSize = address ? 17 : baseHeight(settings);
+                int lineCellDots = address ? FONT_B_ASCII_WIDTH_DOTS : cellDots;
+                Font font = new Font("Noto Sans CJK SC", address ? Font.PLAIN : bold(line, settings) ? Font.BOLD : Font.PLAIN, fontSize);
                 graphics.setFont(font);
                 FontMetrics metrics = graphics.getFontMetrics(font);
-                int textWidth = displayWidth(line.text()) * cellDots * widthScale;
+                int textWidth = displayWidth(line.text()) * lineCellDots * widthScale;
                 int x = switch (alignment(line, settings)) {
                     case "center" -> Math.max(0, (width - textWidth) / 2);
                     case "right" -> Math.max(0, width - textWidth);
                     default -> 0;
                 };
                 drawCellText(graphics, metrics, line.text(), x, y + metrics.getAscent() * heightScale,
-                        cellDots, widthScale, heightScale);
-                y += baseHeight(settings) * heightScale + settings.lineSpacingDots();
+                        lineCellDots, widthScale, heightScale);
+                y += (address ? 17 : baseHeight(settings) * heightScale) + settings.lineSpacingDots();
             }
         } finally { graphics.dispose(); }
         ByteArrayOutputStream output = new ByteArrayOutputStream();
@@ -173,6 +180,7 @@ public class NativeEscPosRenderer {
         for (int i = 0; i < source.length; i++) {
             String text = source[i].stripTrailing();
             if (text.isBlank()) continue;
+            if (text.contains("合计")) continue;
             if (text.matches("[-=_]{4,}")) { addRule(result); continue; }
             String kind = text.contains("仓库") ? "ignored" : isAddress(text) ? "address" : i == company ? "company" : i == title ? "title"
                     : text.contains("合计") || text.contains("实收") ? "total"
@@ -193,6 +201,7 @@ public class NativeEscPosRenderer {
             index = end;
         }
         aligned.addAll(addresses);
+        if (!addresses.isEmpty()) aligned.add(aligned.size() - addresses.size(), new Line("", "feed", 0, 72, null));
         return aligned;
     }
 
@@ -210,6 +219,7 @@ public class NativeEscPosRenderer {
         for (int i = 0; i < source.length; i++) {
             String text = source[i].stripTrailing();
             if (text.isBlank() || text.matches("[-=_]{4,}")) continue;
+            if (text.contains("合计")) continue;
             if (text.contains("仓库")) continue;
             String kind = isAddress(text) ? "address" : i == company ? "company" : i == title ? "title"
                     : text.contains("合计") || text.contains("实收") ? "total"
@@ -229,6 +239,8 @@ public class NativeEscPosRenderer {
             } else {
                 List<String> texts = sections.remove(block.section());
                 if (texts == null) continue;
+                if ("address".equals(block.section()) && !texts.isEmpty())
+                    result.add(new Line("", "feed", 0, 72, null));
                 if ("table".equals(block.section())) texts = formatTableRows(texts, settings, block.width());
                 for (int index = 0; index < texts.size(); index++) {
                     String text = trimForAlignment(texts.get(index), block.align());
@@ -239,6 +251,7 @@ public class NativeEscPosRenderer {
         if (!settings.blocks().stream().anyMatch(block -> "section".equals(block.type()) && "address".equals(block.section()))) {
             List<String> addresses = sections.getOrDefault("address", List.of());
             LayoutBlock addressBlock = section("address", 1, 1, false, "left");
+            if (!addresses.isEmpty()) result.add(new Line("", "feed", 0, 72, null));
             addresses.forEach(text -> result.add(new Line(text, "address", 0, 0, addressBlock)));
         }
         return result;

@@ -19,9 +19,12 @@ public class DeviceTaskRepository {
 
     @Transactional
     public Optional<TaskLease> leaseNext(String deviceId, int leaseSeconds) {
+        Boolean acquired = jdbc.queryForObject("SELECT pg_try_advisory_xact_lock(?)", Boolean.class, 9100001L);
+        if (!Boolean.TRUE.equals(acquired)) return Optional.empty();
         var tasks = jdbc.query("""
                 SELECT id, artifact_size, artifact_sha256 FROM print_jobs
                 WHERE status = 'queued' AND (target_device_id IS NULL OR target_device_id = ?)
+                  AND NOT EXISTS (SELECT 1 FROM print_jobs active WHERE active.status IN ('leased', 'printing'))
                 ORDER BY received_at FOR UPDATE SKIP LOCKED LIMIT 1
                 """, (rs, rowNum) -> new PendingTask(rs.getObject("id", UUID.class),
                 rs.getLong("artifact_size"), rs.getString("artifact_sha256")), deviceId);

@@ -9,6 +9,9 @@ import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.charset.Charset;
+import java.time.ZoneId;
+import java.time.ZonedDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
@@ -24,12 +27,13 @@ public class LegacyEscPosRenderer {
     private static final int MAX_WIDTH = 576;
     private static final int MAX_HEIGHT = 4096;
     private static final int RECEIPT_WIDTH = 576;
+    private static final DateTimeFormatter PRINT_TIME_FORMAT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
     public record LayoutSettings(int companySize, int titleSize, int bodySize, int totalSize,
                                  int tableSpaces, int lineSpacing, boolean companyBold, boolean titleBold,
                                  boolean bodyBold, boolean totalBold, String companyAlign, String titleAlign,
                                  String bodyAlign, String totalAlign) {
         public static LayoutSettings defaults() {
-            return new LayoutSettings(28, 34, 20, 24, 5, 2, false, true, false, false,
+            return new LayoutSettings(30, 38, 26, 30, 10, 4, false, true, false, false,
                     "center", "center", "left", "left");
         }
 
@@ -54,7 +58,11 @@ public class LegacyEscPosRenderer {
     }
 
     public byte[] renderReceiptPreview(String rawText, LayoutSettings settings) throws IOException {
-        return encodePng(renderReceiptImage(rawText, settings));
+        return renderReceiptPreview(rawText, settings, true);
+    }
+
+    public byte[] renderReceiptPreview(String rawText, LayoutSettings settings, boolean includePrintTime) throws IOException {
+        return encodePng(renderReceiptImage(rawText, settings, includePrintTime));
     }
 
     public byte[] renderReceipt(String rawText) throws IOException {
@@ -62,10 +70,14 @@ public class LegacyEscPosRenderer {
     }
 
     public byte[] renderReceipt(String rawText, LayoutSettings settings) throws IOException {
-        return encodeRaster(renderReceiptImage(rawText, settings));
+        return renderReceipt(rawText, settings, true);
     }
 
-    private BufferedImage renderReceiptImage(String rawText, LayoutSettings requestedSettings) {
+    public byte[] renderReceipt(String rawText, LayoutSettings settings, boolean includePrintTime) throws IOException {
+        return encodeRaster(renderReceiptImage(rawText, settings, includePrintTime));
+    }
+
+    private BufferedImage renderReceiptImage(String rawText, LayoutSettings requestedSettings, boolean includePrintTime) {
         if (rawText == null || rawText.isBlank()) throw new IllegalArgumentException("source_text_empty");
         if (rawText.length() > 200_000) throw new IllegalArgumentException("source_text_too_large");
         LayoutSettings settings = requestedSettings == null ? LayoutSettings.defaults() : requestedSettings.validated();
@@ -82,7 +94,7 @@ public class LegacyEscPosRenderer {
                 titleIndex = i;
                 saleTitleFound = true;
             }
-            if (source[i].contains("合计") || source[i].contains("实收")) emphasizedIndexes.add(i);
+            if (source[i].contains("实收")) emphasizedIndexes.add(i);
             if (tableHeaderIndex < 0 && source[i].contains("品名") && source[i].contains("数量")) {
                 tableHeaderIndex = i;
             }
@@ -105,30 +117,50 @@ public class LegacyEscPosRenderer {
             }
         }
         Font regular = font("Noto Sans CJK SC", settings.bodySize(), settings.bodyBold());
+        Font tableFont = font("Noto Sans CJK SC", 28, false);
         Font company = font("Noto Sans CJK SC", settings.companySize(), settings.companyBold());
         Font title = font("Noto Sans CJK SC", settings.titleSize(), settings.titleBold());
         Font total = font("Noto Sans CJK SC", settings.totalSize(), settings.totalBold());
-        Map<Integer,String> formattedTableRows=alignTableRows(source,tableRowIndexes,settings.tableSpaces(),regular);
+        TableLayout tableLayout = formatTableRows(source, tableRowIndexes);
         if (companyIndex >= 0) rows.add(new Row(source[companyIndex].trim(), company, settings.companyAlign(),
                 settings.lineSpacing() + 34, 10, 8, false));
         if (titleIndex >= 0) rows.add(new Row(source[titleIndex].trim(), title, settings.titleAlign(),
                 settings.lineSpacing() + 38, companyIndex >= 0 ? 2 : 10, 12, false));
         Set<Integer> emphasizedAdded = new TreeSet<>();
         for (int i = 0; i < source.length; i++) {
-            boolean included = i < 6 || (i >= 8 && i < source.length - 4);
-            if (!included || i == titleIndex || i == companyIndex || source[i].isBlank()) continue;
+            if (i == titleIndex || i == companyIndex || source[i].isBlank()) continue;
+            if (tableLayout.continuationRows.contains(i)) continue;
             String text = source[i].trim();
-            if (formattedTableRows.containsKey(i)) text = formattedTableRows.get(i);
+            if (text.contains("合计")) continue;
+            if (text.contains("未收")) continue;
+            if (text.contains("仓库") || text.matches("^操作员\\s*[:：]\\s*$")) continue;
+            if (text.matches("[-=_]{4,}")) {
+                rows.add(new Row("", regular, "left", 10, 3, 3, true));
+                continue;
+            }
+            TableLine tableLine = tableLayout.rows.get(i);
             if (emphasizedIndexes.contains(i)) {
-                rows.add(new Row(text, total, settings.totalAlign(), settings.lineSpacing() + 32, 12, 12, true));
+                rows.add(new Row(text, font("Noto Sans CJK SC", settings.totalSize(), true), settings.totalAlign(),
+                        settings.lineSpacing() + 32, 12, 12, false));
                 emphasizedAdded.add(i);
             } else {
-                rows.add(new Row(text, regular, settings.bodyAlign(), settings.lineSpacing() + 26, 3, 3, false));
+                boolean address = text.contains("地址") || text.toLowerCase().contains("address");
+                boolean metadata = text.matches("^(单号|时间|往来单位|客户|用户名|操作员)\\s*[:：].*");
+                Font rowFont = tableLine != null ? tableFont : address
+                        ? font("Noto Sans CJK SC", Math.max(10, settings.bodySize() - 6), false)
+                        : metadata ? metadataFont(text) : regular;
+                rows.add(new Row(text, rowFont, settings.bodyAlign(), settings.lineSpacing() + 26,
+                        address ? settings.lineSpacing() + 90 : 3, 3, false, tableLine));
             }
         }
         for (int index : emphasizedIndexes) {
             if (!emphasizedAdded.contains(index)) rows.add(new Row(source[index].trim(), total, settings.totalAlign(),
                     settings.lineSpacing() + 32, 12, 12, true));
+        }
+        if (includePrintTime) {
+            String printTime = "打印单据时间：" + ZonedDateTime.now(ZoneId.of("Asia/Shanghai")).format(PRINT_TIME_FORMAT);
+            rows.add(new Row(printTime, font("Noto Sans CJK SC", 20, false),
+                    "left", settings.lineSpacing() + 20, 3, 8, false));
         }
         List<LayoutRow> layout = new ArrayList<>(rows.size());
         int height = 10;
@@ -137,8 +169,10 @@ public class LegacyEscPosRenderer {
         try {
             for (Row row : rows) {
                 measureGraphics.setFont(row.font);
-                List<String> lines = wrap(row.text, measureGraphics.getFontMetrics());
-                layout.add(new LayoutRow(row, lines));
+                TableLine tableLine = row.tableLine;
+                List<String> lines = tableLine == null ? wrap(row.text, measureGraphics.getFontMetrics())
+                        : List.of(singleLine(tableLine.name, measureGraphics.getFontMetrics(), TABLE_NAME_WIDTH));
+                layout.add(new LayoutRow(row, lines, tableLine));
                 height += row.before + (row.rule ? 7 : 0) + lines.size() * row.leading + row.after;
                 if (height > MAX_HEIGHT) throw new IllegalArgumentException("image_dimensions_invalid");
             }
@@ -158,9 +192,27 @@ public class LegacyEscPosRenderer {
             for (LayoutRow item : layout) {
                 Row row = item.row;
                 y += row.before;
-                if (row.rule) { graphics.fillRect(8, y, 560, 1); y += 7; }
+                if (row.rule) {
+                    for (int x = 0; x < RECEIPT_WIDTH; x += 7)
+                        graphics.drawLine(x, y, Math.min(x + 4, RECEIPT_WIDTH - 1), y);
+                    y += 7;
+                }
                 graphics.setFont(row.font);
                 FontMetrics metrics = graphics.getFontMetrics();
+                if (item.tableLine != null) {
+                    TableLine cells = item.tableLine;
+                    for (int lineIndex = 0; lineIndex < item.lines.size(); lineIndex++) {
+                        graphics.drawString(item.lines.get(lineIndex), 8, y + row.leading - 3);
+                        if (lineIndex == 0) {
+                            drawRightAligned(graphics, cells.quantity, QUANTITY_RIGHT, y + row.leading - 3);
+                            drawRightAligned(graphics, cells.price, PRICE_RIGHT, y + row.leading - 3);
+                            drawRightAligned(graphics, cells.amount, AMOUNT_RIGHT, y + row.leading - 3);
+                        }
+                        y += row.leading;
+                    }
+                    y += row.after;
+                    continue;
+                }
                 for (String line : item.lines) {
                     int textWidth = metrics.stringWidth(line);
                     int x = switch (row.align) {
@@ -179,8 +231,81 @@ public class LegacyEscPosRenderer {
         return image;
     }
 
+    private Font metadataFont(String text) {
+        if (text.startsWith("单号")) return font("Noto Sans CJK SC", 20, false);
+        if (text.startsWith("时间")) return font("Noto Sans CJK SC", 20, false);
+        if (text.startsWith("往来单位") || text.startsWith("客户") || text.startsWith("操作员"))
+            return font("Noto Sans CJK SC", 22, false);
+        return font("Noto Sans CJK SC", 20, false);
+    }
+
+    private String singleLine(String text, FontMetrics metrics, int maxWidth) {
+        if (metrics.stringWidth(text) <= maxWidth) return text;
+        StringBuilder result = new StringBuilder();
+        for (int offset = 0; offset < text.length();) {
+            int cp = text.codePointAt(offset);
+            String next = new String(Character.toChars(cp));
+            if (metrics.stringWidth(result.toString() + next + "…") > maxWidth) break;
+            result.append(next);
+            offset += Character.charCount(cp);
+        }
+        return result + "…";
+    }
+
     private Font font(String family, int size, boolean bold) {
         return new Font(family, bold ? Font.BOLD : Font.PLAIN, size);
+    }
+
+    private static final int TABLE_NAME_WIDTH = 390;
+    private static final int QUANTITY_RIGHT = 410;
+    private static final int PRICE_RIGHT = 470;
+    private static final int AMOUNT_RIGHT = 568;
+
+    static TableLayout formatTableRows(String[] source, Set<Integer> rowIndexes) {
+        Map<Integer, TableLine> rows = new HashMap<>();
+        Set<Integer> continuationRows = new TreeSet<>();
+        List<Integer> pendingNameRows = new ArrayList<>();
+        List<String> pendingNameParts = new ArrayList<>();
+        for (int index : new TreeSet<>(rowIndexes)) {
+            String text = source[index].trim();
+            String[] cells = text.split("[\\t ]+");
+            if (text.contains("品名") && text.contains("数量")) {
+                rows.put(index, new TableLine("品名", "数量", "单价", "金额"));
+                pendingNameRows.clear();
+                pendingNameParts.clear();
+                continue;
+            }
+            if (cells.length == 3 && numeric(cells[0]) && numeric(cells[1]) && numeric(cells[2])
+                    && !pendingNameRows.isEmpty()) {
+                rows.put(pendingNameRows.get(0), new TableLine(String.join(" ", pendingNameParts),
+                        cells[0], cells[1], cells[2]));
+                continuationRows.addAll(pendingNameRows.subList(1, pendingNameRows.size()));
+                continuationRows.add(index);
+                pendingNameRows.clear();
+                pendingNameParts.clear();
+                continue;
+            }
+            if (cells.length >= 4 && numeric(cells[cells.length - 3]) && numeric(cells[cells.length - 2])
+                    && numeric(cells[cells.length - 1])) {
+                String name = String.join(" ", Arrays.copyOfRange(cells, 0, cells.length - 3));
+                rows.put(index, new TableLine(name, cells[cells.length - 3], cells[cells.length - 2],
+                        cells[cells.length - 1]));
+                pendingNameRows.clear();
+                pendingNameParts.clear();
+                continue;
+            }
+            pendingNameRows.add(index);
+            pendingNameParts.add(text);
+        }
+        return new TableLayout(rows, continuationRows);
+    }
+
+    private static boolean numeric(String value) {
+        return value.matches("[+-]?\\d+(?:\\.\\d+)?");
+    }
+
+    private static void drawRightAligned(Graphics2D graphics, String text, int right, int baseline) {
+        graphics.drawString(text, right - graphics.getFontMetrics().stringWidth(text), baseline);
     }
 
     static Map<Integer,String> alignTableRows(String[] source, Set<Integer> rowIndexes, int spaces, Font font) {
@@ -225,12 +350,16 @@ public class LegacyEscPosRenderer {
     }
 
     private List<String> wrap(String text, FontMetrics metrics) {
+        return wrap(text, metrics, 560);
+    }
+
+    private List<String> wrap(String text, FontMetrics metrics, int maxWidth) {
         List<String> lines = new ArrayList<>();
         StringBuilder part = new StringBuilder();
         for (int offset = 0; offset < text.length();) {
             int cp = text.codePointAt(offset);
             String character = new String(Character.toChars(cp));
-            if (part.length() > 0 && metrics.stringWidth(part + character) > 560) {
+            if (part.length() > 0 && metrics.stringWidth(part + character) > maxWidth) {
                 lines.add(part.toString());
                 part.setLength(0);
             }
@@ -247,8 +376,15 @@ public class LegacyEscPosRenderer {
         return png.toByteArray();
     }
 
-    private record Row(String text, Font font, String align, int leading, int before, int after, boolean rule) {}
-    private record LayoutRow(Row row, List<String> lines) {}
+    private record Row(String text, Font font, String align, int leading, int before, int after, boolean rule,
+                       TableLine tableLine) {
+        private Row(String text, Font font, String align, int leading, int before, int after, boolean rule) {
+            this(text, font, align, leading, before, after, rule, null);
+        }
+    }
+    record TableLayout(Map<Integer, TableLine> rows, Set<Integer> continuationRows) {}
+    record TableLine(String name, String quantity, String price, String amount) {}
+    private record LayoutRow(Row row, List<String> lines, TableLine tableLine) {}
 
     public byte[] renderOriginal(String rawText) {
         ByteArrayOutputStream out = new ByteArrayOutputStream();

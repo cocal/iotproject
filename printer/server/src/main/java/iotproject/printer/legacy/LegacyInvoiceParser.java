@@ -15,12 +15,14 @@ public class LegacyInvoiceParser {
         result.put("lines", List.copyOf(lines));
         result.put("time", firstContaining(lines, "时间"));
         result.put("customer", firstContaining(lines, "往来单位", "客户"));
+        result.put("username", firstContaining(lines, "用户名", "操作员"));
         result.put("invoiceNo", firstContaining(lines, "清单号", "单号"));
         result.put("total", firstContaining(lines, "合计金额", "合计"));
         result.put("received", firstContaining(lines, "实收"));
         result.put("note", firstContaining(lines, "备注"));
         result.put("address", firstContaining(lines, "地址"));
         result.put("items", extractItems(lines));
+        result.put("itemRows", normalizeItemRows(extractItems(lines)));
         result.put("validationErrors", validationErrors(result));
         return result;
     }
@@ -28,7 +30,6 @@ public class LegacyInvoiceParser {
     public List<String> validationErrors(Map<String, Object> payload) {
         List<String> errors = new ArrayList<>();
         requireValue(payload, "invoiceNo", "缺少单号", errors);
-        requireValue(payload, "customer", "缺少客户名称", errors);
         requireValue(payload, "address", "缺少地址", errors);
         Object total = payload.get("total");
         if (!(total instanceof String value) || !AMOUNT.matcher(value.trim()).matches()) {
@@ -68,6 +69,43 @@ public class LegacyInvoiceParser {
             }
         }
         return "";
+    }
+
+    private List<Map<String, String>> normalizeItemRows(List<String> rawItems) {
+        List<Map<String, String>> result = new ArrayList<>();
+        List<String> pendingName = new ArrayList<>();
+        for (String raw : rawItems) {
+            String[] cells = raw.trim().split("[\\t ]+");
+            int numericCells = trailingNumericCells(cells);
+            if (numericCells >= 3) {
+                int start = cells.length - numericCells;
+                List<String> nameParts = new ArrayList<>(pendingName);
+                nameParts.addAll(List.of(cells).subList(0, start));
+                String name = String.join(" ", nameParts).trim();
+                if (!name.isEmpty()) {
+                    Map<String, String> row = new LinkedHashMap<>();
+                    row.put("name", name);
+                    row.put("quantity", cells[start]);
+                    row.put("unit", numericCells == 4 ? cells[start + 1] : "");
+                    row.put("unitPrice", cells[cells.length - 2]);
+                    row.put("amount", cells[cells.length - 1]);
+                    result.add(row);
+                }
+                pendingName.clear();
+            } else {
+                pendingName.add(raw.trim());
+            }
+        }
+        return List.copyOf(result);
+    }
+
+    private int trailingNumericCells(String[] cells) {
+        int count = 0;
+        for (int i = cells.length - 1; i >= 0 && i >= cells.length - 4; i--) {
+            if (AMOUNT.matcher(cells[i]).matches()) count++;
+            else break;
+        }
+        return count >= 3 ? count : 0;
     }
 
     private List<String> extractItems(List<String> lines) {
