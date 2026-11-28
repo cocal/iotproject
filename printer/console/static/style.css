@@ -114,3 +114,7 @@ tbody tr:hover{background:#f8faf9}
 footer{padding:11px 16px}
 dialog{border-radius:8px;padding:18px;border-color:#cfd9dd}
 @media(max-width:850px){header,main{padding-left:16px;padding-right:16px}.toolbar{padding:12px}.device-status-list{grid-template-columns:1fr;padding-left:16px;padding-right:16px}.device-status-item:nth-child(odd){border-right:0}.section-head{padding:14px 12px 10px}}
+
+/* Keep the optional print-time checkbox aligned with its label. */
+#include-print-time-wrap{display:flex;flex-direction:row;align-items:center;align-self:center;gap:8px;white-space:nowrap}
+#include-print-time-wrap input[type="checkbox"]{appearance:auto;width:16px;height:16px;min-width:16px;margin:0;padding:0;flex:0 0 16px;accent-color:#157562}
